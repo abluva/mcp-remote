@@ -10,7 +10,7 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.23.0",
-    "@types/node": "^22.10.2",
+    "@types/node": "^26.1.2",
     "vitest": "^2.1.8"
   }
 }
