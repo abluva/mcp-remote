@@ -90,6 +90,7 @@ Upstream `mcp-remote` is the de facto OAuth bridge for stdio-only MCP clients. S
 |---------|---------------|----------|
 | Claude **hangs** after OAuth / tool errors | [#286](https://github.com/geelen/mcp-remote/issues/286), [#293](https://github.com/geelen/mcp-remote/issues/293) | 0.1.39, 0.1.41 |
 | **`refresh_token is invalid`** at startup | [#181](https://github.com/geelen/mcp-remote/issues/181), [#91](https://github.com/geelen/mcp-remote/issues/91) | 0.1.39 |
+| **Fatal connect** after stale Obot OAuth (`401 after successful authentication`) | Abluva gateway / Hub logout | 2.0.1 |
 | Hub logout → **`localhost` connection refused** on re-auth | [#248](https://github.com/geelen/mcp-remote/issues/248), [#245](https://github.com/geelen/mcp-remote/issues/245) | 0.1.39, 0.1.42 |
 | **Port clash** with multiple MCP servers (no explicit port) | [#306](https://github.com/geelen/mcp-remote/issues/306), [#262](https://github.com/geelen/mcp-remote/pull/262) | 0.1.40, 0.1.42 |
 | Silent token expiry → browser re-auth loops | [#273](https://github.com/geelen/mcp-remote/issues/273) | 0.1.41 ([#290](https://github.com/geelen/mcp-remote/pull/290)) |
@@ -110,7 +111,9 @@ geelen/mcp-remote @ v0.1.38 (main)
                 ├── v0.1.39  OAuth re-auth + eager callback server
                 ├── v0.1.40  Auto callback port / EADDRINUSE recovery
                 ├── v0.1.41  #297, #290, #302
-                └── v0.1.42  Stale registration invalidation + port sync
+                ├── v0.1.42  Stale registration invalidation + port sync
+                ├── v2.0.0   MCP 2026-07-28 stateless transport
+                └── v2.0.1   Connect-time stale OAuth recovery
 ```
 
 ---

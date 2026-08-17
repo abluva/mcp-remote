@@ -31,7 +31,7 @@ These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/i
 | [#248](https://github.com/geelen/mcp-remote/issues/248) | Runtime re-auth opens browser but callback server never starts | Eager callback server at startup; `waitForCallbackServer` before browser |
 | [#245](https://github.com/geelen/mcp-remote/issues/245) | Claude spawns duplicate processes; callback server dies | Dedicated callback server per proxy (`force: true` on startup); reuse listener on re-auth |
 | [#256](https://github.com/geelen/mcp-remote/issues/256) | Re-auth loop: code hits localhost but `POST /token` never called | Keep callback listener alive; correct `finishAuth` + `redirect_uri` sync |
-| [#91](https://github.com/geelen/mcp-remote/issues/91) | Revoked tokens → infinite auth loop / stuck unauthorized | Clear stale tokens; re-auth flow; may still need `rm -rf ~/.mcp-auth` in edge cases |
+| [#91](https://github.com/geelen/mcp-remote/issues/91) | Revoked tokens → infinite auth loop / stuck unauthorized | Clear stale tokens; re-auth flow; connect-time recovery for rejected cached tokens (v2.0.1) |
 | [#293](https://github.com/geelen/mcp-remote/issues/293) | Server send errors swallowed — Claude hangs | Pending-request tracking + JSON-RPC error responses ([#297](https://github.com/geelen/mcp-remote/pull/297)) |
 | [#273](https://github.com/geelen/mcp-remote/issues/273) | No `expires_at` → silent expiry, broken re-auth | Persist `expires_at`; proactive refresh ~60s before expiry ([#290](https://github.com/geelen/mcp-remote/pull/290)) |
 | [#270](https://github.com/geelen/mcp-remote/issues/270) | Token exchange POSTed to resource URL instead of `token_endpoint` | `finishAuth` on transport that received 401 in proxy mode ([#302](https://github.com/geelen/mcp-remote/pull/302)) |
@@ -68,6 +68,7 @@ These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/i
 | Area | Change | Versions |
 |------|--------|----------|
 | **Mid-session OAuth** | `onSendError` handles `UnauthorizedError`, stale refresh, `InvalidRequestError`; opens browser; retries failed JSON-RPC message | 0.1.39+ |
+| **Connect-time stale OAuth** | `401 after successful authentication` at connect → invalidate cached tokens, forced browser re-auth, one reconnect | 2.0.1+ |
 | **Eager callback server** | OAuth listener starts before remote connect and stays up for process lifetime | 0.1.39+ |
 | **Forced re-auth coordination** | Reuse live listener when possible; `forcePrimary` skips lockfile delegation; never close listener unnecessarily | 0.1.39+ |
 | **Auto callback ports** | Per-URL port hashing, bind retry on `EADDRINUSE`, invalidate stale `client_info` when port changes | 0.1.40+ |
@@ -88,6 +89,7 @@ These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/i
 | **0.1.41** | Upstream-aligned: #297, #290, #302; regression tests for proxy-mode `finishAuth` |
 | **0.1.42** | Stronger auto-port + stale registration invalidation; always-on callback server; `setCallbackPort` sync |
 | **2.0.0** | MCP `2026-07-28` stateless remote transport; stdio bridge (initialize shim, `_meta` strip, list-method shims); `--protocol` CLI; localhost OAuth skip; SDK 1.30 |
+| **2.0.1** | Connect-time recovery when Obot/gateway rejects cached OAuth (`401 after successful authentication`); opens browser instead of fatal exit |
 
 ---
 
@@ -145,6 +147,7 @@ cd mcp-remote && npm install && npm run build
 This fork was developed and tested against the **Abluva MCP filter gateway** (`agent.abluva.com` / Hub OAuth):
 
 - Hub logout → mid-session re-auth
+- Hub logout / redeploy → **connect-time** re-auth when cached Obot token is rejected (`401 after successful authentication`, v2.0.1+)
 - Short-lived MCP access tokens + refresh
 - Multiple MCP servers in one Claude config (SQL Sandbox + Atlassian, etc.)
 

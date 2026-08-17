@@ -167,6 +167,74 @@ function resetTransportAuthState(transport: Transport): void {
   }
 }
 
+/** SDK throws this when OAuth refresh succeeded but the server still returned 401 on retry. */
+export function isStalePostAuth401Error(error: unknown): boolean {
+  return (
+    error instanceof StreamableHTTPError &&
+    error.code === 401 &&
+    error.message.includes('401 after successful authentication')
+  )
+}
+
+async function reconnectAfterStaleOAuthAtConnect(
+  error: unknown,
+  options: {
+    authProvider: OAuthClientProvider
+    transport: Transport
+    authChallengeTransport?: Transport
+    authInitializer: AuthInitializer
+    serverUrl: string
+    recursionReasons: Set<string>
+    reconnect: () => Promise<Transport>
+  },
+): Promise<Transport> {
+  log('Rejected OAuth token at connect — clearing stale credentials and re-authenticating...')
+  try {
+    if (typeof (options.authProvider as { invalidateCredentials?: (scope: string) => Promise<void> }).invalidateCredentials === 'function') {
+      await options.authProvider.invalidateCredentials('tokens')
+    }
+  } catch (invalidateError) {
+    debugLog('Failed to invalidate cached OAuth tokens at connect', { invalidateError })
+  }
+  resetTransportAuthState(options.transport)
+  if (options.authChallengeTransport) {
+    resetTransportAuthState(options.authChallengeTransport)
+  }
+
+  if (options.recursionReasons.has(REASON_AUTH_NEEDED)) {
+    throw error instanceof Error ? error : new Error(String(error))
+  }
+
+  const { waitForAuthCode, skipBrowserAuth, callbackPort } = await options.authInitializer(true)
+
+  if (!skipBrowserAuth && callbackPort > 0) {
+    await waitForCallbackServer(callbackPort)
+  }
+
+  if (!skipBrowserAuth && options.serverUrl) {
+    const authResult = await runMcpOAuthAuth(options.authProvider, { serverUrl: options.serverUrl })
+    if (authResult === 'REDIRECT') {
+      log(`Opened browser for MCP re-authentication at connect (callback port ${callbackPort ?? 'unknown'})`)
+    }
+  } else if (skipBrowserAuth) {
+    log('Authentication required but skipping browser auth - using shared auth')
+  } else {
+    log('Authentication required. Waiting for authorization...')
+  }
+
+  const code = await waitForAuthCode()
+  log('Completing authorization after stale token rejection at connect...')
+  const finishTarget = options.authChallengeTransport ?? options.transport
+  if (!('finishAuth' in finishTarget) || typeof finishTarget.finishAuth !== 'function') {
+    throw new Error('Transport does not support finishAuth')
+  }
+  await finishTarget.finishAuth(code)
+
+  options.recursionReasons.add(REASON_AUTH_NEEDED)
+  log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`)
+  return options.reconnect()
+}
+
 export function isLocalHttpServer(serverUrl: string): boolean {
   try {
     const url = new URL(serverUrl)
@@ -754,6 +822,27 @@ export async function connectToRemoteServer(
       log(`Connected to remote server using StatelessHTTPTransport (${PROTOCOL_2026_07_28})`)
       return transport
     } catch (error: any) {
+      if (isStalePostAuth401Error(error)) {
+        return reconnectAfterStaleOAuthAtConnect(error, {
+          authProvider,
+          transport,
+          authChallengeTransport,
+          authInitializer,
+          serverUrl,
+          recursionReasons,
+          reconnect: () =>
+            connectToRemoteServer(
+              client,
+              serverUrl,
+              authProvider,
+              headers,
+              authInitializer,
+              transportStrategy,
+              recursionReasons,
+              PROTOCOL_2026_07_28,
+            ),
+        })
+      }
       if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
         log('Authentication required. Initializing auth...')
         const { waitForAuthCode, skipBrowserAuth, callbackPort: authCallbackPort } = await authInitializer()
@@ -920,7 +1009,28 @@ export async function connectToRemoteServer(
         authInitializer,
         transportStrategy,
         recursionReasons,
+        protocolMode,
       )
+    } else if (isStalePostAuth401Error(error)) {
+      return reconnectAfterStaleOAuthAtConnect(error, {
+        authProvider,
+        transport,
+        authChallengeTransport,
+        authInitializer,
+        serverUrl,
+        recursionReasons,
+        reconnect: () =>
+          connectToRemoteServer(
+            client,
+            serverUrl,
+            authProvider,
+            headers,
+            authInitializer,
+            transportStrategy,
+            recursionReasons,
+            protocolMode,
+          ),
+      })
     } else if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
       log('Authentication required. Initializing auth...')
       debugLog('Authentication error detected', {
@@ -968,7 +1078,16 @@ export async function connectToRemoteServer(
         debugLog('Recursively reconnecting after auth', { recursionReasons: Array.from(recursionReasons) })
 
         // Recursively call connectToRemoteServer with the updated recursion tracking
-        return connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy, recursionReasons)
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          recursionReasons,
+          protocolMode,
+        )
       } catch (authError: any) {
         log('Authorization error:', authError)
         debugLog('Authorization error during finishAuth', {

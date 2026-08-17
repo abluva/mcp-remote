@@ -3,12 +3,18 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 const mockState = vi.hoisted(() => ({
   httpTransports: [] as Array<{ start: ReturnType<typeof vi.fn>; finishAuth: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }>,
   connectFailuresRemaining: 1,
+  connectError: null as Error | null,
+}))
+
+vi.mock('@modelcontextprotocol/sdk/client/auth.js', () => ({
+  UnauthorizedError: class UnauthorizedError extends Error {},
+  auth: vi.fn().mockResolvedValue('REDIRECT'),
 }))
 
 vi.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => {
   class StreamableHTTPError extends Error {
     code?: number
-    constructor(message: string, code?: number) {
+    constructor(code: number, message: string) {
       super(message)
       this.code = code
     }
@@ -49,19 +55,33 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => {
     async connect() {
       if (mockState.connectFailuresRemaining > 0) {
         mockState.connectFailuresRemaining--
-        throw new Error('Unauthorized')
+        throw mockState.connectError ?? new Error('Unauthorized')
       }
     }
   }
   return { Client }
 })
 
-import { connectToRemoteServer } from './utils'
+import { connectToRemoteServer, isStalePostAuth401Error } from './utils'
+import { StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { auth as runMcpOAuthAuth } from '@modelcontextprotocol/sdk/client/auth.js'
+
+describe('isStalePostAuth401Error', () => {
+  it('matches StreamableHTTPError 401 after successful authentication', () => {
+    expect(
+      isStalePostAuth401Error(new StreamableHTTPError(401, 'Server returned 401 after successful authentication')),
+    ).toBe(true)
+    expect(isStalePostAuth401Error(new StreamableHTTPError(401, 'Unauthorized'))).toBe(false)
+    expect(isStalePostAuth401Error(new Error('Unauthorized'))).toBe(false)
+  })
+})
 
 describe('connectToRemoteServer', () => {
   beforeEach(() => {
     mockState.httpTransports.length = 0
     mockState.connectFailuresRemaining = 1
+    mockState.connectError = null
+    vi.mocked(runMcpOAuthAuth).mockResolvedValue('REDIRECT' as any)
     vi.spyOn(console, 'error').mockImplementation(() => {})
   })
 
@@ -100,5 +120,33 @@ describe('connectToRemoteServer', () => {
     const [mainTransport] = mockState.httpTransports
     expect(mainTransport.finishAuth).toHaveBeenCalledTimes(1)
     expect(mainTransport.finishAuth).toHaveBeenCalledWith('auth-code-456')
+  })
+
+  it('re-authenticates at connect when server rejects cached OAuth (401 after successful authentication)', async () => {
+    mockState.connectFailuresRemaining = 1
+    mockState.connectError = new StreamableHTTPError(401, 'Server returned 401 after successful authentication')
+
+    const invalidateCredentials = vi.fn().mockResolvedValue(undefined)
+    const authProvider = { invalidateCredentials } as any
+    const authInitializer = vi.fn().mockResolvedValue({
+      waitForAuthCode: async () => 'fresh-auth-code',
+      skipBrowserAuth: false,
+      callbackPort: 0,
+    })
+
+    await connectToRemoteServer(
+      null,
+      'https://agent.example.com/mcp-connect/ms1abc',
+      authProvider,
+      {},
+      authInitializer,
+      'http-first',
+    )
+
+    expect(invalidateCredentials).toHaveBeenCalledWith('tokens')
+    expect(authInitializer).toHaveBeenCalledWith(true)
+    expect(runMcpOAuthAuth).toHaveBeenCalled()
+    const [, testTransport] = mockState.httpTransports
+    expect(testTransport.finishAuth).toHaveBeenCalledWith('fresh-auth-code')
   })
 })
