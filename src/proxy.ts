@@ -98,19 +98,36 @@ async function runProxy(
       debugLog('No Protected Resource Metadata found, using server URL as authorization server')
     }
 
-    // Claude Desktop may spawn duplicate processes — always run our own callback server.
-    log(`Ensuring OAuth callback server is listening...`)
-    initialAuthState = await authCoordinator.initializeAuth({ force: true })
+    if (discoveryResult.serverAccessibleWithoutAuth) {
+      // The server is reachable without authentication, so no OAuth flow will run. Skip eager
+      // election entirely: otherwise a secondary instance would block forever waiting for an
+      // auth completion that never happens (Risk 1). If the server unexpectedly returns 401
+      // later, the lazy authInitializer still coordinates on demand.
+      log('Remote server is accessible without authentication — skipping eager OAuth coordination')
+      initialAuthState = {
+        skipBrowserAuth: true,
+        callbackPort: 0,
+        waitForAuthCode: async () => {
+          throw new Error('OAuth is not required for this server')
+        },
+      }
+    } else {
+      // Claude Desktop may spawn duplicate processes for the same server. Participate in the
+      // cross-process election: exactly one instance binds the callback port (primary) and runs
+      // the browser OAuth flow; the others coordinate as secondaries and reuse tokens from disk.
+      log(`Ensuring OAuth callback server is listening...`)
+      initialAuthState = await authCoordinator.initializeAuth()
 
-    effectiveCallbackPort = initialAuthState.callbackPort
-    server = initialAuthState.server
-    if (!initialAuthState.skipBrowserAuth) {
-      await waitForCallbackServer(effectiveCallbackPort)
+      effectiveCallbackPort = initialAuthState.callbackPort
+      server = initialAuthState.server
+      if (!initialAuthState.skipBrowserAuth) {
+        await waitForCallbackServer(effectiveCallbackPort)
+      }
+      if (!initialAuthState.skipBrowserAuth && !(await isCallbackServerListening(effectiveCallbackPort))) {
+        throw new Error(`OAuth callback server failed to start on port ${effectiveCallbackPort}`)
+      }
+      log(`OAuth callback server ready on port ${effectiveCallbackPort}`)
     }
-    if (!initialAuthState.skipBrowserAuth && !(await isCallbackServerListening(effectiveCallbackPort))) {
-      throw new Error(`OAuth callback server failed to start on port ${effectiveCallbackPort}`)
-    }
-    log(`OAuth callback server ready on port ${effectiveCallbackPort}`)
   }
 
   const authProvider = new NodeOAuthClientProvider({

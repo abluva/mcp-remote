@@ -668,6 +668,12 @@ export interface OAuthServerDiscoveryResult {
   protectedResourceMetadata?: ProtectedResourceMetadata
   /** Scope extracted from WWW-Authenticate header */
   wwwAuthenticateScope?: string
+  /**
+   * True when the initial probe reached the server successfully without authentication
+   * (HTTP 200). Callers can use this to skip eager OAuth callback-server coordination so a
+   * secondary instance does not block forever waiting for an auth flow that never happens.
+   */
+  serverAccessibleWithoutAuth?: boolean
 }
 
 /**
@@ -713,6 +719,7 @@ export async function discoverOAuthServerInfo(
       return {
         authorizationServerUrl: serverUrl,
         authorizationServerMetadata: authServerMetadata,
+        serverAccessibleWithoutAuth: true,
       }
     }
 
@@ -1197,7 +1204,7 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
     options.events.emit('auth-code-received', code)
   })
 
-  const { server, port } = await bindExpressServer(app, options.port)
+  const { server, port } = await bindExpressServer(app, options.port, options.allowPortFallback !== false)
 
   const waitForAuthCode = (): Promise<string> => {
     return new Promise((resolve) => {
@@ -1251,6 +1258,17 @@ function calculateDefaultPort(serverUrlHash: string): number {
   return 3335 + (hash % 45816)
 }
 
+/**
+ * Deterministic fallback callback port for a given attempt, used when the canonical callback
+ * port is occupied by an unrelated process. Because the sequence is derived only from the
+ * server hash, all concurrent instances compute the same candidate ports — so the exclusive
+ * port bind still elects exactly one primary even during fallback (prevents two primaries when
+ * a foreign process squats on the canonical port).
+ */
+export function calculateFallbackPort(serverUrlHash: string, attempt: number): number {
+  return calculateDefaultPort(`${serverUrlHash}:fallback:${attempt}`)
+}
+
 async function canBindPort(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const probe = net.createServer()
@@ -1270,13 +1288,13 @@ export async function invalidateOAuthClientRegistration(serverUrlHash: string, r
 }
 
 async function resolveCallbackPort(serverUrlHash: string, specifiedPort?: number): Promise<number> {
+  // Resolve the *deterministic* canonical callback port. We intentionally do NOT probe/drift
+  // here: concurrent instances must all target the same port so that coordinateAuth can use an
+  // exclusive bind of that port as the cross-process election mutex. Genuine port conflicts
+  // (an unrelated process holding the port) are handled by coordinateAuth's fallback path.
   const defaultPort = calculateDefaultPort(serverUrlHash)
-  const [existingClientPort, availablePort] = await Promise.all([
-    findExistingClientPort(serverUrlHash),
-    findAvailablePort(defaultPort),
-  ])
+  const existingClientPort = await findExistingClientPort(serverUrlHash)
 
-  let candidate: number
   if (specifiedPort) {
     if (existingClientPort && specifiedPort !== existingClientPort) {
       await invalidateOAuthClientRegistration(
@@ -1284,27 +1302,21 @@ async function resolveCallbackPort(serverUrlHash: string, specifiedPort?: number
         `callback port changed from ${existingClientPort} to ${specifiedPort}`,
       )
     }
-    candidate = specifiedPort
-  } else if (existingClientPort) {
-    candidate = existingClientPort
-  } else {
-    candidate = availablePort
+    return specifiedPort
   }
 
-  if (await canBindPort(candidate)) {
-    return candidate
+  if (existingClientPort) {
+    return existingClientPort
   }
 
-  const replacement = await findAvailablePort(0)
-  log(`OAuth callback port ${candidate} is unavailable — using ${replacement} instead`)
-  await invalidateOAuthClientRegistration(
-    serverUrlHash,
-    `callback port moved from ${candidate} to ${replacement}`,
-  )
-  return replacement
+  return defaultPort
 }
 
-async function bindExpressServer(app: express.Application, preferredPort: number): Promise<{ server: Server; port: number }> {
+async function bindExpressServer(
+  app: express.Application,
+  preferredPort: number,
+  allowFallback = true,
+): Promise<{ server: Server; port: number }> {
   let port = preferredPort
 
   for (let attempt = 0; attempt < 30; attempt++) {
@@ -1322,8 +1334,14 @@ async function bindExpressServer(app: express.Application, preferredPort: number
       }
 
       return { server, port }
+
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+        // When used as an election mutex the caller must observe EADDRINUSE (to become a
+        // secondary) instead of silently drifting to another port.
+        if (!allowFallback) {
+          throw error
+        }
         port = await findAvailablePort(0)
         continue
       }

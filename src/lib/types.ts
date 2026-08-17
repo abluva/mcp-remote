@@ -55,6 +55,12 @@ export interface OAuthCallbackServerOptions {
   events: EventEmitter
   /** Timeout in milliseconds for the auth callback server's long poll */
   authTimeoutMs?: number
+  /**
+   * Whether the server may fall back to a different port if the requested port is in use.
+   * Defaults to true. Set to false when the caller uses the bind as a cross-process
+   * election mutex and must observe EADDRINUSE instead of silently drifting.
+   */
+  allowPortFallback?: boolean
 }
 
 // optional tatic OAuth client information
