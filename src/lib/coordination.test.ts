@@ -98,8 +98,10 @@ describe('coordinateAuth — cross-process OAuth election (Issue #17)', () => {
     const hash = getServerUrlHash('https://concurrent.example.com/mcp')
     const port = await findAvailablePort()
 
-    const p1 = coordinateAuth(hash, port, new EventEmitter(), 500)
-    const p2 = coordinateAuth(hash, port, new EventEmitter(), 500)
+    // Generous auth timeout: the secondary's wait is now bounded by authTimeoutMs, so give it
+    // comfortable margin over the ~400ms we wait before completing the primary's auth.
+    const p1 = coordinateAuth(hash, port, new EventEmitter(), 5000)
+    const p2 = coordinateAuth(hash, port, new EventEmitter(), 5000)
 
     // Let both processes run the election, then complete the primary's auth so the
     // secondary unblocks and reads tokens from disk.
@@ -140,13 +142,14 @@ describe('coordinateAuth — cross-process OAuth election (Issue #17)', () => {
     const hash = getServerUrlHash('https://takeover.example.com/mcp')
     const port = await findAvailablePort()
 
-    // First instance becomes primary.
-    const primary = await coordinateAuth(hash, port, new EventEmitter(), 500)
+    // First instance becomes primary. Generous auth timeout so the secondary's bounded wait
+    // has comfortable margin over the ~400ms before the primary exits.
+    const primary = await coordinateAuth(hash, port, new EventEmitter(), 5000)
     expect(primary.skipBrowserAuth).toBe(false)
     expect(primary.callbackPort).toBe(port)
 
     // Second instance starts while the primary is alive -> becomes a waiting secondary.
-    const takeover = coordinateAuth(hash, port, new EventEmitter(), 500)
+    const takeover = coordinateAuth(hash, port, new EventEmitter(), 5000)
 
     await new Promise((r) => setTimeout(r, 400))
 
@@ -173,8 +176,9 @@ describe('coordinateAuth — cross-process OAuth election (Issue #17)', () => {
     await new Promise<void>((resolve) => blocker.listen(canonicalPort, '127.0.0.1', () => resolve()))
 
     // Two mcp-remote instances start concurrently against the same (foreign-occupied) canonical port.
-    const p1 = coordinateAuth(hash, canonicalPort, new EventEmitter(), 500)
-    const p2 = coordinateAuth(hash, canonicalPort, new EventEmitter(), 500)
+    // Generous auth timeout so the secondary's bounded wait has comfortable margin.
+    const p1 = coordinateAuth(hash, canonicalPort, new EventEmitter(), 5000)
+    const p2 = coordinateAuth(hash, canonicalPort, new EventEmitter(), 5000)
 
     // The primary resolves quickly (on a deterministic fallback port); the secondary blocks.
     const first = await Promise.race([p1, p2])
@@ -199,12 +203,39 @@ describe('coordinateAuth — cross-process OAuth election (Issue #17)', () => {
     expect(primaries[0].callbackPort).toBe(calculateFallbackPort(hash, 1))
   }, 25000)
 
+  it('secondary fails with a timeout error (does not hang forever) when the primary stays alive but never completes OAuth (review comment #1)', async () => {
+    const hash = getServerUrlHash('https://never-completes.example.com/mcp')
+    const port = await findAvailablePort()
+
+    // First instance becomes primary and stays alive, but authentication is never completed
+    // (simulating a user who closes the browser or an auth flow that hangs).
+    const primaryAuthTimeoutMs = 300
+    const primary = await coordinateAuth(hash, port, new EventEmitter(), primaryAuthTimeoutMs)
+    track(primary.server)
+    expect(primary.skipBrowserAuth).toBe(false)
+    expect(primary.callbackPort).toBe(port)
+
+    // Second instance becomes a waiting secondary. Its wait must be bounded by the shared
+    // --auth-timeout (authTimeoutMs) rather than looping forever.
+    const secondaryAuthTimeoutMs = 1000
+    const start = Date.now()
+
+    await expect(coordinateAuth(hash, port, new EventEmitter(), secondaryAuthTimeoutMs)).rejects.toThrow(/timed out/i)
+
+    const elapsed = Date.now() - start
+    // It waited roughly the configured timeout (not forever) and did not return early.
+    expect(elapsed).toBeGreaterThanOrEqual(secondaryAuthTimeoutMs - 100)
+    expect(elapsed).toBeLessThan(secondaryAuthTimeoutMs + 3000)
+  }, 15000)
+
   it('secondary picks up the tokens the primary wrote to disk (token handoff, not just skipBrowserAuth)', async () => {
     const hash = getServerUrlHash('https://handoff.example.com/mcp')
     const port = await findAvailablePort()
 
-    const p1 = coordinateAuth(hash, port, new EventEmitter(), 500)
-    const p2 = coordinateAuth(hash, port, new EventEmitter(), 500)
+    // Generous auth timeout so the secondary's bounded wait has comfortable margin over the
+    // token persistence + completion handshake below.
+    const p1 = coordinateAuth(hash, port, new EventEmitter(), 5000)
+    const p2 = coordinateAuth(hash, port, new EventEmitter(), 5000)
 
     const first = await Promise.race([p1, p2])
     expect(first.skipBrowserAuth).toBe(false)

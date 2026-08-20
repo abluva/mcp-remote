@@ -1,4 +1,4 @@
-import { createLockfile, deleteLockfile, getConfigFilePath, LockfileData } from './mcp-auth-config'
+import { createLockfile, deleteLockfile, getConfigFilePath } from './mcp-auth-config'
 import { EventEmitter } from 'events'
 import { Server } from 'http'
 import express from 'express'
@@ -32,131 +32,37 @@ type PrimaryHandlers = {
 }
 
 /**
- * Checks if a process with the given PID is running
- * @param pid The process ID to check
- * @returns True if the process is running, false otherwise
- */
-export async function isPidRunning(pid: number): Promise<boolean> {
-  try {
-    process.kill(pid, 0) // Doesn't kill the process, just checks if it exists
-    debugLog(`Process ${pid} is running`)
-    return true
-  } catch (err) {
-    debugLog(`Process ${pid} is not running`, err)
-    return false
-  }
-}
-
-/**
- * Checks if a lockfile is valid (process running and endpoint accessible)
- * @param lockData The lockfile data
- * @returns True if the lockfile is valid, false otherwise
- */
-export async function isLockValid(lockData: LockfileData): Promise<boolean> {
-  debugLog('Checking if lockfile is valid', lockData)
-
-  // Check if the lockfile is too old (over 30 minutes)
-  const MAX_LOCK_AGE = 30 * 60 * 1000 // 30 minutes
-  if (Date.now() - lockData.timestamp > MAX_LOCK_AGE) {
-    log('Lockfile is too old')
-    debugLog('Lockfile is too old', {
-      age: Date.now() - lockData.timestamp,
-      maxAge: MAX_LOCK_AGE,
-    })
-    return false
-  }
-
-  // Check if the process is still running
-  if (!(await isPidRunning(lockData.pid))) {
-    log('Process from lockfile is not running')
-    debugLog('Process from lockfile is not running', { pid: lockData.pid })
-    return false
-  }
-
-  // Check if the endpoint is accessible
-  try {
-    debugLog('Checking if endpoint is accessible', { port: lockData.port })
-
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 1000)
-
-    const response = await fetch(`http://127.0.0.1:${lockData.port}/wait-for-auth?poll=false`, {
-      signal: controller.signal,
-    })
-
-    clearTimeout(timeout)
-
-    const isValid = response.status === 200 || response.status === 202
-    debugLog(`Endpoint check result: ${isValid ? 'valid' : 'invalid'}`, { status: response.status })
-    return isValid
-  } catch (error) {
-    log(`Error connecting to auth server: ${(error as Error).message}`)
-    debugLog('Error connecting to auth server', error)
-    return false
-  }
-}
-
-/**
- * Waits for authentication from another server instance
- * @param port The port to connect to
- * @returns True if authentication completed successfully, false otherwise
- */
-export async function waitForAuthentication(port: number): Promise<boolean> {
-  log(`Waiting for authentication from the server on port ${port}...`)
-
-  try {
-    let attempts = 0
-    while (true) {
-      attempts++
-      const url = `http://127.0.0.1:${port}/wait-for-auth`
-      log(`Querying: ${url}`)
-      debugLog(`Poll attempt ${attempts}`)
-
-      try {
-        const response = await fetch(url)
-        debugLog(`Poll response status: ${response.status}`)
-
-        if (response.status === 200) {
-          // Auth completed, but we don't return the code anymore
-          log(`Authentication completed by other instance`)
-          return true
-        } else if (response.status === 202) {
-          // Continue polling
-          log(`Authentication still in progress`)
-          debugLog(`Will retry in 1s`)
-          await new Promise((resolve) => setTimeout(resolve, 1000))
-        } else {
-          log(`Unexpected response status: ${response.status}`)
-          return false
-        }
-      } catch (fetchError) {
-        debugLog(`Fetch error during poll`, fetchError)
-        // If we can't connect, we'll try again after a delay
-        await new Promise((resolve) => setTimeout(resolve, 2000))
-      }
-    }
-  } catch (error) {
-    log(`Error waiting for authentication: ${(error as Error).message}`)
-    debugLog(`Error waiting for authentication`, error)
-    return false
-  }
-}
-
-/**
  * Waits for the elected primary instance to finish authentication, while detecting
  * whether the primary has gone away (so a secondary can take over).
  *
+ * The wait is bounded by the shared `--auth-timeout` (authTimeoutMs): if the primary
+ * stays alive but never completes OAuth (e.g. the user closes the browser), the
+ * secondary fails with a timeout instead of hanging forever.
+ *
  * @param port The primary's callback port
+ * @param authTimeoutMs Total upper bound for how long the secondary waits for the primary
  * @returns 'completed' when the primary finished auth (tokens are on disk),
- *          'gone' when the primary is no longer listening (caller should re-elect)
+ *          'gone' when the primary is no longer listening (caller should re-elect),
+ *          'timeout' when authTimeoutMs elapsed while the primary was still authenticating
  */
-async function waitForPrimaryOrTakeover(port: number): Promise<'completed' | 'gone'> {
+async function waitForPrimaryOrTakeover(port: number, authTimeoutMs: number): Promise<'completed' | 'gone' | 'timeout'> {
   log(`Waiting for authentication from the primary on port ${port}...`)
+  // authTimeoutMs is the actual TOTAL wait budget for the secondary. Every wait below is
+  // clamped to whatever is left of this budget, and once it is exhausted we return 'timeout'
+  // immediately — we never spend extra fixed time after the deadline.
+  const deadline = Date.now() + authTimeoutMs
   while (true) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      log(`Timed out after ${authTimeoutMs}ms waiting for the primary instance to complete authentication`)
+      return 'timeout'
+    }
     try {
       // Long-poll: primary returns 200 when auth completes, 202 while still in progress.
+      // Cap each poll at the remaining budget so the total wait never exceeds authTimeoutMs
+      // even if an individual long-poll is still running when the deadline is reached.
       const response = await fetch(`http://127.0.0.1:${port}/wait-for-auth`, {
-        signal: AbortSignal.timeout(35000),
+        signal: AbortSignal.timeout(Math.min(35000, remaining)),
       })
       if (response.status === 200) {
         log('Authentication completed by primary instance')
@@ -164,13 +70,26 @@ async function waitForPrimaryOrTakeover(port: number): Promise<'completed' | 'go
       }
       debugLog('Primary still authenticating (status 202); continuing to wait')
     } catch (error) {
-      // A failed poll may mean the primary exited. Confirm with a quick liveness probe.
+      // A failed poll may mean the primary exited. Confirm with a liveness probe, but only if
+      // budget remains — and bound the probe by the remaining budget so it can't run past the
+      // deadline.
       debugLog('Primary poll failed; checking whether primary is still alive', error)
-      if (!(await isCallbackServerListening(port))) {
+      const remainingAfterPoll = deadline - Date.now()
+      if (remainingAfterPoll <= 0) {
+        log(`Timed out after ${authTimeoutMs}ms waiting for the primary instance to complete authentication`)
+        return 'timeout'
+      }
+      if (!(await isCallbackServerListening(port, Math.min(750, remainingAfterPoll)))) {
         log('Primary instance is no longer listening on the callback port')
         return 'gone'
       }
-      await new Promise((resolve) => setTimeout(resolve, 500))
+      // Primary is still alive. If the budget is now spent, fail rather than sleeping past it.
+      const remainingAfterProbe = deadline - Date.now()
+      if (remainingAfterProbe <= 0) {
+        log(`Timed out after ${authTimeoutMs}ms waiting for the primary instance to complete authentication`)
+        return 'timeout'
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(500, remainingAfterProbe)))
     }
   }
 }
@@ -398,10 +317,17 @@ export async function coordinateAuth(
     if (occupantIsOurs) {
       // 3) SECONDARY — wait for that primary to finish, then use tokens from disk.
       log(`Another mcp-remote instance owns callback port ${port}; waiting as secondary`)
-      const outcome = await waitForPrimaryOrTakeover(port)
+      const outcome = await waitForPrimaryOrTakeover(port, authTimeoutMs)
       if (outcome === 'completed') {
         log('Authentication completed by another instance. Using tokens from disk')
         return makeSecondaryResult()
+      }
+      if (outcome === 'timeout') {
+        // Primary stayed alive but never completed OAuth within the shared auth timeout.
+        // Fail loudly instead of waiting forever (review comment #1).
+        throw new Error(
+          `Timed out after ${authTimeoutMs}ms waiting for the primary mcp-remote instance on callback port ${port} to complete authentication`,
+        )
       }
       // Primary vanished before completing auth — retry the SAME candidate port to take over.
       log('Primary instance went away before completing auth; attempting takeover')

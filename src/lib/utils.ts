@@ -244,10 +244,10 @@ export function isLocalHttpServer(serverUrl: string): boolean {
   }
 }
 
-export async function isCallbackServerListening(port: number): Promise<boolean> {
+export async function isCallbackServerListening(port: number, probeTimeoutMs = 750): Promise<boolean> {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/wait-for-auth?poll=false`, {
-      signal: AbortSignal.timeout(750),
+      signal: AbortSignal.timeout(probeTimeoutMs),
     })
     return response.status === 200 || response.status === 202
   } catch {
