@@ -86,6 +86,26 @@ describe('Feature: Command Line Arguments Parsing', () => {
     })
   })
 
+  it('Scenario: Log custom header names without leaking values', async () => {
+    // Given command line arguments with a sensitive Authorization header
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const args = ['https://example.com/sse', '--header', 'Authorization: Bearer super-secret-token']
+    const usage = 'test usage'
+
+    try {
+      // When parsing the command line arguments
+      const result = await parseCommandLineArgs(args, usage)
+
+      // Then the header name is logged but its value is not
+      expect(result.headers).toEqual({ Authorization: 'Bearer super-secret-token' })
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Using custom header names: Authorization'))
+      const loggedOutput = consoleSpy.mock.calls.map((call) => call.join(' ')).join('\n')
+      expect(loggedOutput).not.toContain('super-secret-token')
+    } finally {
+      consoleSpy.mockRestore()
+    }
+  })
+
   it('Scenario: Ignore invalid header format', async () => {
     // Given command line arguments with an invalid header format
     const args = ['https://example.com/sse', '--header', 'invalid-header-format']
