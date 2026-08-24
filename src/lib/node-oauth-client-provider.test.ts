@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import open from 'open'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 import * as mcpAuthConfig from './mcp-auth-config'
 import type { OAuthProviderOptions } from './types'
@@ -301,5 +302,384 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       // Empty scope should fallback to default
       expect(clientMetadata.scope).toBe('openid email profile')
     })
+  })
+})
+
+describe('NodeOAuthClientProvider - stale dynamic client registration preflight (#299)', () => {
+  let provider: NodeOAuthClientProvider
+  let mockReadJsonFile: any
+  let mockWriteJsonFile: any
+  let mockDeleteConfigFile: any
+
+  const defaultOptions: OAuthProviderOptions = {
+    serverUrl: 'https://example.com',
+    callbackPort: 8080,
+    host: 'localhost',
+    serverUrlHash: 'test-hash',
+  }
+
+  // Exact upstream stale-registration response shape: a DCR registration_endpoint plus an
+  // error_description stating the client is not registered.
+  const staleBody = {
+    registration_endpoint: 'https://auth.example.com/register',
+    error: 'invalid_request',
+    error_description: "Client ID 'fresh-client' is not registered with this server",
+  }
+
+  const authUrl = () => new URL('https://auth.example.com/authorize?client_id=fresh-client')
+  const AUTH_ORIGIN = 'https://auth.example.com'
+
+  // Minimal fetch Response stand-ins (only the fields the preflight reads).
+  const redirectResponse = (location: string, status = 302) => ({
+    status,
+    headers: { get: (h: string) => (h.toLowerCase() === 'location' ? location : null) },
+  })
+  const jsonResponse = (status: number, value: unknown, contentType = 'application/json; charset=utf-8') => ({
+    status,
+    headers: { get: (h: string) => (h.toLowerCase() === 'content-type' ? contentType : null) },
+    json: async () => value,
+  })
+  const htmlResponse = (status = 200, body = '<html>consent</html>') => ({
+    status,
+    headers: { get: (h: string) => (h.toLowerCase() === 'content-type' ? 'text/html; charset=utf-8' : null) },
+    json: async () => {
+      throw new Error('not json')
+    },
+    text: async () => body,
+  })
+
+  // The provider is detection-only: it must never delete shared OAuth state. Ownership-gated
+  // invalidation happens in connectToRemoteServer (primary only), covered by the connect tests.
+  const expectNoInvalidation = () => {
+    expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+  }
+
+  const asCachedDynamic = async (p: NodeOAuthClientProvider) => {
+    mockReadJsonFile.mockResolvedValueOnce({
+      client_id: 'cached-client',
+      redirect_uris: ['http://localhost:8080/oauth/callback'],
+    })
+    await p.clientInformation() // source = 'cached-dynamic'
+  }
+
+  beforeEach(() => {
+    mockReadJsonFile = vi.mocked(mcpAuthConfig.readJsonFile)
+    mockWriteJsonFile = vi.mocked(mcpAuthConfig.writeJsonFile)
+    mockDeleteConfigFile = vi.mocked(mcpAuthConfig.deleteConfigFile)
+
+    mockReadJsonFile.mockResolvedValue(undefined)
+    mockWriteJsonFile.mockResolvedValue(undefined)
+    mockDeleteConfigFile.mockResolvedValue(undefined)
+  })
+
+  afterEach(() => {
+    vi.clearAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('cached dynamic client: stale 400 JSON throws, does NOT delete credentials, browser not opened', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    mockReadJsonFile.mockResolvedValueOnce({
+      client_id: 'cached-client',
+      redirect_uris: ['http://localhost:8080/oauth/callback'],
+    })
+    await provider.clientInformation() // source = 'cached-dynamic'
+
+    const mockFetch = vi.fn().mockResolvedValue({ status: 400, json: async () => staleBody })
+    vi.stubGlobal('fetch', mockFetch)
+
+    await expect(provider.redirectToAuthorization(authUrl())).rejects.toMatchObject({
+      name: 'StaleClientRegistrationError',
+      message: 'Cached OAuth client registration is no longer valid',
+    })
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        redirect: 'manual',
+        headers: { Accept: 'application/json' },
+        signal: expect.any(AbortSignal),
+      }),
+    )
+    expectNoInvalidation()
+    expect(open).not.toHaveBeenCalled()
+  })
+
+  it('fresh dynamic client: stale response throws, does NOT delete credentials, browser not opened', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    await provider.saveClientInformation({
+      client_id: 'fresh-client',
+      redirect_uris: ['http://localhost:8080/oauth/callback'],
+    }) // source = 'fresh-dynamic'
+
+    const mockFetch = vi.fn().mockResolvedValue({ status: 400, json: async () => staleBody })
+    vi.stubGlobal('fetch', mockFetch)
+
+    await expect(provider.redirectToAuthorization(authUrl())).rejects.toMatchObject({
+      name: 'StaleClientRegistrationError',
+    })
+
+    expectNoInvalidation()
+    expect(open).not.toHaveBeenCalled()
+  })
+
+  it('stale 302 -> same-origin consent -> 400 JSON string "Invalid client_id": throws, no deletion, no browser', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    await asCachedDynamic(provider)
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectResponse(`${AUTH_ORIGIN}/consent`))
+      .mockResolvedValueOnce(jsonResponse(400, 'Invalid client_id'))
+    vi.stubGlobal('fetch', mockFetch)
+
+    await expect(provider.redirectToAuthorization(authUrl())).rejects.toMatchObject({
+      name: 'StaleClientRegistrationError',
+      message: 'Cached OAuth client registration is no longer valid',
+    })
+
+    // One authorize probe + one bounded same-origin consent GET.
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      2,
+      `${AUTH_ORIGIN}/consent`,
+      expect.objectContaining({ redirect: 'manual', signal: expect.any(AbortSignal) }),
+    )
+    expectNoInvalidation()
+    expect(open).not.toHaveBeenCalled()
+  })
+
+  it('valid 302 -> same-origin consent -> 200 HTML: no invalidation, browser opens', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    await asCachedDynamic(provider)
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectResponse(`${AUTH_ORIGIN}/consent`))
+      .mockResolvedValueOnce(htmlResponse(200))
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('cross-origin consent Location is NOT probed: no throw, browser opens', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    await asCachedDynamic(provider)
+
+    const mockFetch = vi.fn().mockResolvedValueOnce(redirectResponse('https://evil.example.com/consent'))
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    // Only the authorize probe runs; the cross-origin consent URL is never fetched.
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('consent probe network failure: no throw, browser opens', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    await asCachedDynamic(provider)
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectResponse(`${AUTH_ORIGIN}/consent`))
+      .mockRejectedValueOnce(new Error('network down'))
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('consent probe timeout: no throw, browser opens', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    await asCachedDynamic(provider)
+
+    const timeoutError = Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectResponse(`${AUTH_ORIGIN}/consent`))
+      .mockRejectedValueOnce(timeoutError)
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('consent 400 JSON string with a different message is NOT stale', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    await asCachedDynamic(provider)
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectResponse(`${AUTH_ORIGIN}/consent`))
+      .mockResolvedValueOnce(jsonResponse(400, 'You are not allowed'))
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('consent 400 JSON object (not a string) is NOT stale', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    await asCachedDynamic(provider)
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectResponse(`${AUTH_ORIGIN}/consent`))
+      .mockResolvedValueOnce(jsonResponse(400, { error: 'Invalid client_id' }))
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('consent 400 generic OAuth JSON error is NOT stale', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    await asCachedDynamic(provider)
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectResponse(`${AUTH_ORIGIN}/consent`))
+      .mockResolvedValueOnce(jsonResponse(400, { error: 'invalid_request', error_description: 'bad request' }))
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('consent 400 text/html containing the phrase is NOT stale (must be application/json)', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    await asCachedDynamic(provider)
+
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(redirectResponse(`${AUTH_ORIGIN}/consent`))
+      .mockResolvedValueOnce(htmlResponse(400, 'Invalid client_id'))
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('static client: no preflight, browser opens normally', async () => {
+    provider = new NodeOAuthClientProvider({
+      ...defaultOptions,
+      staticOAuthClientInfo: {
+        client_id: 'static-client',
+        redirect_uris: ['http://localhost:8080/oauth/callback'],
+      } as any,
+    })
+    await provider.clientInformation() // source = 'static'
+
+    const mockFetch = vi.fn()
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expect(mockFetch).not.toHaveBeenCalled()
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('redirect_uri-not-registered 400 is NOT classified as stale', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    mockReadJsonFile.mockResolvedValueOnce({
+      client_id: 'cached-client',
+      redirect_uris: ['http://localhost:8080/oauth/callback'],
+    })
+    await provider.clientInformation()
+
+    const mockFetch = vi.fn().mockResolvedValue({
+      status: 400,
+      json: async () => ({
+        registration_endpoint: 'https://auth.example.com/register',
+        error: 'invalid_request',
+        error_description: 'The redirect_uri is not registered for this client',
+      }),
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('invalid_scope / generic 400 is NOT classified as stale', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    mockReadJsonFile.mockResolvedValueOnce({
+      client_id: 'cached-client',
+      redirect_uris: ['http://localhost:8080/oauth/callback'],
+    })
+    await provider.clientInformation()
+
+    const mockFetch = vi.fn().mockResolvedValue({
+      status: 400,
+      json: async () => ({
+        registration_endpoint: 'https://auth.example.com/register',
+        error: 'invalid_scope',
+        error_description: 'The requested scope is invalid or unknown',
+      }),
+    })
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('network error during preflight: browser still opens', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    mockReadJsonFile.mockResolvedValueOnce({
+      client_id: 'cached-client',
+      redirect_uris: ['http://localhost:8080/oauth/callback'],
+    })
+    await provider.clientInformation()
+
+    const mockFetch = vi.fn().mockRejectedValue(new Error('network down'))
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('preflight timeout: browser still opens', async () => {
+    provider = new NodeOAuthClientProvider(defaultOptions)
+    mockReadJsonFile.mockResolvedValueOnce({
+      client_id: 'cached-client',
+      redirect_uris: ['http://localhost:8080/oauth/callback'],
+    })
+    await provider.clientInformation()
+
+    const timeoutError = Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })
+    const mockFetch = vi.fn().mockRejectedValue(timeoutError)
+    vi.stubGlobal('fetch', mockFetch)
+
+    await provider.redirectToAuthorization(authUrl())
+
+    expectNoInvalidation()
+    expect(open).toHaveBeenCalledOnce()
   })
 })

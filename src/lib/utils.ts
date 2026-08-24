@@ -15,6 +15,7 @@ import {
   type ProtectedResourceMetadata,
 } from './protected-resource-metadata'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
+import { StaleClientRegistrationError } from './stale-client-registration-error'
 import express from 'express'
 import { Server } from 'http'
 import net from 'net'
@@ -44,6 +45,7 @@ declare global {
 // Connection constants
 export const REASON_AUTH_NEEDED = 'authentication-needed'
 export const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
+export const REASON_STALE_CLIENT_REGISTRATION = 'stale-client-registration'
 
 export type { ProtocolMode, DiscoverResult } from './stateless-protocol.js'
 export { PROTOCOL_2026_07_28 } from './stateless-protocol.js'
@@ -232,6 +234,59 @@ async function reconnectAfterStaleOAuthAtConnect(
 
   options.recursionReasons.add(REASON_AUTH_NEEDED)
   log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`)
+  return options.reconnect()
+}
+
+/**
+ * Ownership-gated, bounded recovery for a stale/immediately-rejected dynamic OAuth client
+ * registration (#299).
+ *
+ * The provider only DETECTS staleness (it does not delete shared OAuth state). Recovery must be
+ * gated on cross-process (#17) ownership so a secondary never invalidates files the primary is
+ * using:
+ *   - authInitializer() (no force) establishes/learns ownership via the existing coordinator.
+ *   - PRIMARY / took-over (skipBrowserAuth === false): invalidate all cached credentials, then
+ *     reconnect; the SDK then performs fresh dynamic client registration -> normal OAuth.
+ *   - SECONDARY (skipBrowserAuth === true): the coordinator already waited for the primary to
+ *     finish and write fresh client_info + tokens to disk; do NOT invalidate anything, just
+ *     reconnect and reuse the primary's recovered state from disk.
+ *
+ * Retry is bounded to exactly once via the shared recursionReasons set. authInitializer() is
+ * called WITHOUT a force argument so this never resets/re-elects #17 coordination.
+ */
+async function recoverFromStaleClientRegistration(
+  error: StaleClientRegistrationError,
+  options: {
+    authProvider: OAuthClientProvider
+    authInitializer: AuthInitializer
+    recursionReasons: Set<string>
+    reconnect: () => Promise<Transport>
+  },
+): Promise<Transport> {
+  if (options.recursionReasons.has(REASON_STALE_CLIENT_REGISTRATION)) {
+    throw error
+  }
+  options.recursionReasons.add(REASON_STALE_CLIENT_REGISTRATION)
+
+  const { skipBrowserAuth } = await options.authInitializer()
+
+  if (!skipBrowserAuth) {
+    if (
+      typeof (options.authProvider as { invalidateCredentials?: (scope: string) => Promise<void> })
+        .invalidateCredentials === 'function'
+    ) {
+      log('Stale OAuth client registration — primary clearing credentials before fresh registration')
+      await options.authProvider.invalidateCredentials('all')
+    } else {
+      // Cannot clear the stale client registration — fail clearly and never reconnect with stale state.
+      log('Stale OAuth client registration — provider cannot clear it; failing without reconnect')
+      throw error
+    }
+  } else {
+    log('Stale OAuth client registration — secondary reusing primary recovery (no invalidation)')
+  }
+
+  log(`Recursively reconnecting for reason: ${REASON_STALE_CLIENT_REGISTRATION}`)
   return options.reconnect()
 }
 
@@ -829,6 +884,24 @@ export async function connectToRemoteServer(
       log(`Connected to remote server using StatelessHTTPTransport (${PROTOCOL_2026_07_28})`)
       return transport
     } catch (error: any) {
+      if (error instanceof StaleClientRegistrationError) {
+        return recoverFromStaleClientRegistration(error, {
+          authProvider,
+          authInitializer,
+          recursionReasons,
+          reconnect: () =>
+            connectToRemoteServer(
+              client,
+              serverUrl,
+              authProvider,
+              headers,
+              authInitializer,
+              transportStrategy,
+              recursionReasons,
+              PROTOCOL_2026_07_28,
+            ),
+        })
+      }
       if (isStalePostAuth401Error(error)) {
         return reconnectAfterStaleOAuthAtConnect(error, {
           authProvider,
@@ -957,6 +1030,24 @@ export async function connectToRemoteServer(
 
     return transport
   } catch (error: any) {
+    if (error instanceof StaleClientRegistrationError) {
+      return recoverFromStaleClientRegistration(error, {
+        authProvider,
+        authInitializer,
+        recursionReasons,
+        reconnect: () =>
+          connectToRemoteServer(
+            client,
+            serverUrl,
+            authProvider,
+            headers,
+            authInitializer,
+            transportStrategy,
+            recursionReasons,
+            protocolMode,
+          ),
+      })
+    }
     // Check if it's a protocol error and we should attempt fallback
     // StreamableHTTPError has a `code` property with the HTTP status code
     const isStreamableHTTPError = error instanceof StreamableHTTPError

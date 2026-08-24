@@ -15,11 +15,38 @@ import { sanitizeUrl } from 'strict-url-sanitise'
 import { randomUUID } from 'node:crypto'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import type { ProtectedResourceMetadata } from './protected-resource-metadata'
+import { StaleClientRegistrationError } from './stale-client-registration-error'
 
 const OAuthTokensWithExpiresAtSchema = OAuthTokensSchema.extend({
   expires_at: z.coerce.number().optional(),
 })
 type OAuthTokensWithExpiresAt = z.infer<typeof OAuthTokensWithExpiresAtSchema>
+
+type ClientRegistrationSource = 'cached-dynamic' | 'fresh-dynamic' | 'static' | undefined
+
+function isStaleClientRegistrationResponse(response: unknown): boolean {
+  if (!response || typeof response !== 'object') {
+    return false
+  }
+
+  const { registration_endpoint: registrationEndpoint, error_description: errorDescription } = response as Record<string, unknown>
+  return (
+    typeof registrationEndpoint === 'string' &&
+    typeof errorDescription === 'string' &&
+    /\bclient(?:\s+id)?\b\s+(?:['"][^'"]+['"]\s+)?is\s+not[\s-]+registered\b/i.test(errorDescription)
+  )
+}
+
+/**
+ * Narrow matcher for the consent-redirect stale-client shape (Path 2). Some authorization servers
+ * (e.g. Stack Overflow) do not surface an invalid/stale client at /authorize; instead /authorize
+ * returns a 30x to a same-origin consent URL, and fetching that consent URL directly returns
+ * 400/401 application/json whose body is exactly the JSON string "Invalid client_id". This matches
+ * ONLY that precise scalar-string shape — not JSON objects, arrays, or other messages.
+ */
+function isStaleClientConsentBody(parsed: unknown): boolean {
+  return typeof parsed === 'string' && parsed.trim().toLowerCase() === 'invalid client_id'
+}
 
 /**
  * Implements the OAuthClientProvider interface for Node.js environments.
@@ -37,6 +64,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private authorizeResource: string | undefined
   private _state: string
   private _clientInfo: OAuthClientInformationFull | undefined
+  private clientRegistrationSource: ClientRegistrationSource
   private authorizationServerMetadata: AuthorizationServerMetadata | undefined
   private protectedResourceMetadata: ProtectedResourceMetadata | undefined
   private wwwAuthenticateScope: string | undefined
@@ -58,6 +86,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.authorizeResource = options.authorizeResource
     this._state = randomUUID()
     this._clientInfo = undefined
+    this.clientRegistrationSource = undefined
     this.authorizationServerMetadata = options.authorizationServerMetadata
     this.protectedResourceMetadata = options.protectedResourceMetadata
     this.wwwAuthenticateScope = options.wwwAuthenticateScope
@@ -174,6 +203,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     if (this.staticOAuthClientInfo) {
       debugLog('Returning static client info')
       this._clientInfo = this.staticOAuthClientInfo
+      this.clientRegistrationSource = 'static'
       return this.staticOAuthClientInfo
     }
     const clientInfo = await readJsonFile<OAuthClientInformationFull>(
@@ -184,6 +214,9 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     if (clientInfo) {
       this._clientInfo = clientInfo
+      if (this.clientRegistrationSource !== 'fresh-dynamic') {
+        this.clientRegistrationSource = 'cached-dynamic'
+      }
     }
 
     debugLog('Client info result:', clientInfo ? 'Found' : 'Not found')
@@ -197,6 +230,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   async saveClientInformation(clientInformation: OAuthClientInformationFull): Promise<void> {
     debugLog('Saving client info', { client_id: clientInformation.client_id })
     this._clientInfo = clientInformation
+    this.clientRegistrationSource = 'fresh-dynamic'
     await writeJsonFile(this.serverUrlHash, 'client_info.json', clientInformation)
   }
 
@@ -306,6 +340,8 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
 
     debugLog('Redirecting to authorization URL', authorizationUrl.toString())
 
+    await this.preflightDynamicClientRegistration(authorizationUrl)
+
     try {
       await open(sanitizeUrl(authorizationUrl.toString()))
       log('Browser opened automatically.')
@@ -313,6 +349,130 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
       log('Could not open browser automatically. Please copy and paste the URL above into your browser.')
       debugLog('Failed to open browser', error)
     }
+  }
+
+  /**
+   * Preflights the authorization URL for dynamically-registered clients to detect a cached
+   * (or freshly-registered) client_id that the authorization server no longer accepts.
+   *
+   * Two server shapes are handled, both DETECTION-ONLY (this never invalidates credentials —
+   * that is gated on #17 ownership in connectToRemoteServer):
+   *   1. /authorize returns 400/401 application/json describing an unregistered client
+   *      (matched by isStaleClientRegistrationResponse).
+   *   2. /authorize returns a 30x to a SAME-ORIGIN consent URL that only reveals the error when
+   *      fetched directly. Observed with Stack Overflow: GET consent -> 400 application/json whose
+   *      body is exactly the JSON string "Invalid client_id" (matched by
+   *      probeConsentRedirectForStaleClient).
+   *
+   * Any other outcome (non-dynamic client, network failure, timeout, cross-origin redirect,
+   * non-400/401 status, non-JSON body, or non-matching body) returns normally so the browser
+   * flow proceeds unchanged.
+   *
+   * Intentionally avoids logging the authorization URL, client_id, state, PKCE
+   * challenge/verifier, response body, or any tokens/secrets.
+   */
+  private async preflightDynamicClientRegistration(authorizationUrl: URL): Promise<void> {
+    if (this.clientRegistrationSource !== 'cached-dynamic' && this.clientRegistrationSource !== 'fresh-dynamic') {
+      return
+    }
+
+    let response: Response
+    try {
+      response = await fetch(authorizationUrl.toString(), {
+        redirect: 'manual',
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(5_000),
+      })
+    } catch {
+      debugLog('Authorization preflight failed; continuing to browser authorization')
+      return
+    }
+
+    // Path 1: authorization server returns the error directly at /authorize as 400/401 JSON.
+    if (response.status === 400 || response.status === 401) {
+      let errorResponse: unknown
+      try {
+        errorResponse = await response.json()
+      } catch {
+        debugLog('Authorization preflight returned invalid JSON; continuing to browser authorization')
+        return
+      }
+      if (isStaleClientRegistrationResponse(errorResponse)) {
+        debugLog('Authorization preflight detected stale client registration (authorize JSON)')
+        throw new StaleClientRegistrationError()
+      }
+      return
+    }
+
+    // Path 2: authorization server redirects (30x) to a same-origin consent URL that only reveals
+    // the invalid-client error when that consent URL is fetched directly.
+    if (response.status >= 300 && response.status < 400) {
+      await this.probeConsentRedirectForStaleClient(response, authorizationUrl)
+    }
+  }
+
+  /**
+   * Makes at most one bounded GET to the same-origin consent Location returned by a 30x
+   * /authorize response, and throws StaleClientRegistrationError only when that consent response
+   * is 400/401 application/json whose parsed body is exactly the JSON string "Invalid client_id".
+   *
+   * Detection-only; never invalidates credentials. Cross-origin redirects, non-400/401 statuses,
+   * non-JSON content types, non-string JSON, and non-matching strings all return normally so the
+   * browser flow is unchanged. Never logs the URL, query values, or body contents.
+   */
+  private async probeConsentRedirectForStaleClient(redirectResponse: Response, authorizationUrl: URL): Promise<void> {
+    const location = redirectResponse.headers.get('location')
+    if (!location) {
+      return
+    }
+
+    let consentUrl: URL
+    try {
+      consentUrl = new URL(location, authorizationUrl)
+    } catch {
+      return
+    }
+
+    // Only probe a redirect that stays on the authorization server's own origin.
+    if (consentUrl.origin !== authorizationUrl.origin) {
+      debugLog('Authorization preflight redirect is cross-origin; not probing consent URL')
+      return
+    }
+
+    let consentResponse: Response
+    try {
+      consentResponse = await fetch(consentUrl.toString(), {
+        redirect: 'manual',
+        headers: { Accept: 'text/html,application/json' },
+        signal: AbortSignal.timeout(5_000),
+      })
+    } catch {
+      debugLog('Consent preflight probe failed; continuing to browser authorization')
+      return
+    }
+
+    if (consentResponse.status !== 400 && consentResponse.status !== 401) {
+      return
+    }
+
+    if (!/application\/json/i.test(consentResponse.headers.get('content-type') ?? '')) {
+      return
+    }
+
+    let parsed: unknown
+    try {
+      parsed = await consentResponse.json()
+    } catch {
+      debugLog('Consent preflight returned invalid JSON; continuing to browser authorization')
+      return
+    }
+
+    if (!isStaleClientConsentBody(parsed)) {
+      return
+    }
+
+    debugLog('Authorization preflight detected stale client registration (consent JSON)')
+    throw new StaleClientRegistrationError()
   }
 
   /**
@@ -350,12 +510,14 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
           deleteConfigFile(this.serverUrlHash, 'code_verifier.txt'),
         ])
         this._clientInfo = undefined
+        this.clientRegistrationSource = undefined
         debugLog('All credentials invalidated')
         break
 
       case 'client':
         await deleteConfigFile(this.serverUrlHash, 'client_info.json')
         this._clientInfo = undefined
+        this.clientRegistrationSource = undefined
         debugLog('Client information invalidated')
         break
 
