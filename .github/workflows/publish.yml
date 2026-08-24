@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup pnpm & install
-        uses: wyvox/action-setup-pnpm@v3
+        uses: wyvox/action-setup-pnpm@v4
         with:
           node-version: 22
 
