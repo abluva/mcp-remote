@@ -1102,3 +1102,268 @@ describe('Feature: Server URL Hash Generation', () => {
     expect(hash1).toBe(hash2)
   })
 })
+
+import { mcpProxy as mcpProxyForSse, PROTOCOL_2026_07_28 } from './utils'
+import { ReinitAwareSSEClientTransport } from './reinit-aware-sse-transport'
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
+
+describe('Feature: Legacy SSE session recovery (issue #269)', () => {
+  function makeClient() {
+    return {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: undefined as any,
+      onclose: undefined as any,
+      onerror: undefined as any,
+    } as unknown as Transport
+  }
+
+  /** A ReinitAwareSSEClientTransport with network methods stubbed so mcpProxy wires reinit onto it. */
+  function makeSseServer(behavior?: (msg: any, ctx: { respond: (r: any) => void; server: any; sent: any[] }) => void) {
+    const server = new ReinitAwareSSEClientTransport(new URL('http://localhost/sse')) as any
+    const sent: any[] = []
+    server.start = vi.fn().mockResolvedValue(undefined)
+    server.close = vi.fn().mockResolvedValue(undefined)
+    server.setProtocolVersion = vi.fn()
+    server.finishAuth = vi.fn().mockResolvedValue(undefined)
+    const respond = (r: any) => server.onmessage?.(r)
+    server.send = vi.fn(async (msg: any) => {
+      sent.push(msg)
+      behavior?.(msg, { respond, server, sent })
+    })
+    return { server, sent }
+  }
+
+  const isReinit = (m: any) => typeof m.id === 'string' && m.id.startsWith('mcp-remote-reinit-')
+
+  function sendInitialize(client: Transport, id: string | number = '1') {
+    client.onmessage?.({
+      jsonrpc: '2.0',
+      method: 'initialize',
+      id,
+      params: { clientInfo: { name: 'Test Client', version: '1.0.0' }, protocolVersion: '2024-11-05' },
+    } as any)
+  }
+
+  it('Scenario: Rotation replays initialize with an internal sentinel id and sends notifications/initialized', async () => {
+    const client = makeClient()
+    const { server, sent } = makeSseServer((msg, { respond }) => {
+      if (isReinit(msg)) setTimeout(() => respond({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26' } }), 0)
+    })
+
+    mcpProxyForSse({ transportToClient: client, transportToServer: server, ignoredTools: [] })
+    sendInitialize(client)
+
+    // When the SSE session rotates
+    server.onSessionRotated!()
+
+    await vi.waitFor(() => expect(sent.some((m) => m.method === 'notifications/initialized')).toBe(true))
+
+    const replay = sent.find(isReinit)
+    expect(replay).toBeDefined()
+    expect(replay.method).toBe('initialize')
+    expect(replay.params.clientInfo.name).toContain('Test Client')
+
+    // Protocol version negotiated by the new session is applied to the transport
+    expect(server.setProtocolVersion).toHaveBeenCalledWith('2025-03-26')
+
+    // The internal reinit response is consumed by the proxy, never forwarded to the local client
+    expect(client.send).not.toHaveBeenCalledWith(expect.objectContaining({ id: replay.id }))
+  })
+
+  it('Scenario: A normal request waits until reinit completes before being sent', async () => {
+    const client = makeClient()
+    const { server, sent } = makeSseServer((msg, { respond }) => {
+      if (isReinit(msg)) {
+        setTimeout(() => respond({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26' } }), 0)
+      } else if (msg.method === 'tools/call') {
+        setTimeout(() => respond({ jsonrpc: '2.0', id: msg.id, result: { ok: true } }), 0)
+      }
+    })
+
+    mcpProxyForSse({ transportToClient: client, transportToServer: server, ignoredTools: [] })
+    sendInitialize(client)
+
+    // Rotation starts reinit; a tool call arrives while reinit is in flight
+    server.onSessionRotated!()
+    client.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: '2', params: { name: 'echo' } } as any)
+
+    await vi.waitFor(() => expect(sent.some((m) => m.method === 'tools/call' && m.id === '2')).toBe(true))
+
+    const reinitIdx = sent.findIndex(isReinit)
+    const notifIdx = sent.findIndex((m) => m.method === 'notifications/initialized')
+    const callIdx = sent.findIndex((m) => m.method === 'tools/call' && m.id === '2')
+
+    // Order: initialize replay -> notifications/initialized -> the queued tool call
+    expect(reinitIdx).toBeGreaterThanOrEqual(0)
+    expect(notifIdx).toBeGreaterThan(reinitIdx)
+    expect(callIdx).toBeGreaterThan(notifIdx)
+  })
+
+  it('Scenario: Concurrent rotation and requests share a single reinit', async () => {
+    const client = makeClient()
+    const { server, sent } = makeSseServer((msg, { respond }) => {
+      if (isReinit(msg)) {
+        setTimeout(() => respond({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26' } }), 5)
+      } else if (msg.method === 'tools/call') {
+        setTimeout(() => respond({ jsonrpc: '2.0', id: msg.id, result: { ok: true } }), 0)
+      }
+    })
+
+    mcpProxyForSse({ transportToClient: client, transportToServer: server, ignoredTools: [] })
+    sendInitialize(client)
+
+    // Two rotations and two requests race while the session is dead
+    server.onSessionRotated!()
+    server.onSessionRotated!()
+    client.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: '2', params: { name: 'a' } } as any)
+    client.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: '3', params: { name: 'b' } } as any)
+
+    await vi.waitFor(() => expect(sent.filter((m) => m.method === 'tools/call').length).toBe(2))
+
+    // Exactly one handshake and one notifications/initialized are shared by all callers
+    expect(sent.filter(isReinit)).toHaveLength(1)
+    expect(sent.filter((m) => m.method === 'notifications/initialized')).toHaveLength(1)
+  })
+
+  it('Scenario: A -32602/-32600 error response does not trigger reinit', async () => {
+    const client = makeClient()
+    const { server, sent } = makeSseServer()
+
+    mcpProxyForSse({ transportToClient: client, transportToServer: server, ignoredTools: [] })
+    sendInitialize(client)
+
+    // Server answers a tool call with an ordinary JSON-RPC error (not a rotation signal)
+    client.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: '2', params: { name: 'x' } } as any)
+    server.onmessage?.({ jsonrpc: '2.0', id: '2', error: { code: -32602, message: 'Invalid request parameters' } })
+    server.onmessage?.({ jsonrpc: '2.0', id: '3', error: { code: -32600, message: 'Invalid request' } })
+
+    await vi.waitFor(() => expect(client.send).toHaveBeenCalledWith(expect.objectContaining({ id: '2' })))
+
+    // No re-initialize handshake was sent
+    expect(sent.filter(isReinit)).toHaveLength(0)
+  })
+
+  it('Scenario: Rotation with interactive OAuth recovers auth then retries the handshake once', async () => {
+    const client = makeClient()
+    let reinitAttempts = 0
+    const { server, sent } = makeSseServer((msg, { respond, server }) => {
+      if (isReinit(msg)) {
+        reinitAttempts++
+        if (reinitAttempts === 1) {
+          // First handshake on the fresh session needs auth: mimic SSE send() (fires onerror + throws)
+          server.onerror?.(new UnauthorizedError())
+          throw new UnauthorizedError()
+        }
+        setTimeout(() => respond({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26' } }), 0)
+      }
+    })
+
+    const authInitializer = vi
+      .fn()
+      .mockResolvedValue({ waitForAuthCode: vi.fn().mockResolvedValue('auth-code'), skipBrowserAuth: true, callbackPort: 0 })
+
+    mcpProxyForSse({ transportToClient: client, transportToServer: server, ignoredTools: [], authInitializer })
+    sendInitialize(client)
+
+    server.onSessionRotated!()
+
+    await vi.waitFor(() => expect(sent.some((m) => m.method === 'notifications/initialized')).toBe(true))
+
+    // OAuth recovery ran once (single-flight) and the handshake was retried exactly once
+    expect(authInitializer).toHaveBeenCalledTimes(1)
+    expect(server.finishAuth).toHaveBeenCalledTimes(1)
+    expect(reinitAttempts).toBe(2)
+    expect(server.setProtocolVersion).toHaveBeenCalledWith('2025-03-26')
+  })
+
+  it('Scenario: OAuth recovery failure during reinit does not loop', async () => {
+    const client = makeClient()
+    let reinitAttempts = 0
+    const { server, sent } = makeSseServer((msg) => {
+      if (isReinit(msg)) {
+        reinitAttempts++
+        throw new UnauthorizedError()
+      }
+    })
+
+    const authInitializer = vi.fn().mockRejectedValue(new Error('auth failed'))
+
+    mcpProxyForSse({ transportToClient: client, transportToServer: server, ignoredTools: [], authInitializer })
+    sendInitialize(client)
+
+    server.onSessionRotated!()
+
+    // Give the recovery attempt time to settle
+    await new Promise((r) => setTimeout(r, 20))
+
+    // Auth was attempted once and the handshake was not retried after the auth failure (no loop)
+    expect(authInitializer).toHaveBeenCalledTimes(1)
+    expect(reinitAttempts).toBe(1)
+    expect(sent.filter((m) => m.method === 'notifications/initialized')).toHaveLength(0)
+  })
+
+  it('Scenario: OAuth-only recovery (no SSE rotation) is unchanged', async () => {
+    const client = makeClient()
+    const serverSend = vi
+      .fn()
+      .mockRejectedValueOnce(new UnauthorizedError())
+      .mockResolvedValue(undefined)
+    const server = {
+      send: serverSend,
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      finishAuth: vi.fn().mockResolvedValue(undefined),
+      onmessage: undefined as any,
+      onclose: undefined as any,
+      onerror: undefined as any,
+    } as unknown as Transport
+
+    const authInitializer = vi
+      .fn()
+      .mockResolvedValue({ waitForAuthCode: vi.fn().mockResolvedValue('auth-code'), skipBrowserAuth: true, callbackPort: 0 })
+
+    mcpProxyForSse({ transportToClient: client, transportToServer: server, ignoredTools: [], authInitializer })
+
+    client.onmessage?.({ jsonrpc: '2.0', method: 'tools/call', id: '9', params: { name: 'ping' } } as any)
+
+    await vi.waitFor(() => expect((server as any).finishAuth).toHaveBeenCalledTimes(1))
+
+    // The failed request is retried after re-auth; no reinit handshake exists on this path
+    await vi.waitFor(() => expect(serverSend).toHaveBeenCalledTimes(2))
+    expect(serverSend.mock.calls.every(([m]) => !(typeof m.id === 'string' && m.id.startsWith('mcp-remote-reinit-')))).toBe(true)
+  })
+
+  it('Scenario: Stateless 2026-07-28 path answers initialize locally and never reinits', async () => {
+    const client = makeClient()
+    const server = {
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: undefined as any,
+      onclose: undefined as any,
+      onerror: undefined as any,
+    } as unknown as Transport
+
+    mcpProxyForSse({
+      transportToClient: client,
+      transportToServer: server,
+      ignoredTools: [],
+      remoteProtocolMode: PROTOCOL_2026_07_28,
+    })
+
+    // initialize is shimmed locally: answered to the client, not forwarded to the remote
+    client.onmessage?.({
+      jsonrpc: '2.0',
+      method: 'initialize',
+      id: '1',
+      params: { clientInfo: { name: 'Test Client', version: '1.0.0' }, protocolVersion: '2024-11-05' },
+    } as any)
+
+    await vi.waitFor(() => expect(client.send).toHaveBeenCalledWith(expect.objectContaining({ id: '1' })))
+    expect(server.send).not.toHaveBeenCalledWith(expect.objectContaining({ method: 'initialize' }))
+    // A plain (non-SSE) transport never gets the rotation hook wired
+    expect((server as any).onSessionRotated).toBeUndefined()
+  })
+})

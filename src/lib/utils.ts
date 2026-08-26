@@ -2,6 +2,7 @@ import { OAuthClientProvider, UnauthorizedError, auth as runMcpOAuthAuth } from 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { ReinitAwareSSEClientTransport, isReinitAwareSSETransport } from './reinit-aware-sse-transport'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import { OAuthClientInformationFull, OAuthClientInformationFullSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
@@ -365,6 +366,17 @@ export function mcpProxy({
   let lastOutboundRequest: Message | undefined
   let authRecoveryInFlight: Promise<void> | null = null
 
+  // --- Legacy SSE session recovery state (issue #269) ---
+  // The client's initialize request, cached so it can be replayed verbatim onto a new SSE
+  // session after an EventSource reconnect rotated the endpoint/session id.
+  let lastInitialize: Message | undefined
+  // Single-flight guard: several rotations / requests coalesce into one re-initialize.
+  let reinitInFlight: Promise<void> | null = null
+  // Monotonic counter for the internal (sentinel) re-initialize request id.
+  let reinitSeq = 0
+  // Sentinel reinit ids awaiting their response; consumed by the proxy, never forwarded to client.
+  const pendingReinit = new Map<string, (message: Message) => void>()
+
   // Track in-flight request ids so transport-level onerror (e.g. SSE 429) can unblock
   // waiting clients with JSON-RPC errors instead of hanging indefinitely.
   const pendingRequests = new Map<string | number, true>()
@@ -504,8 +516,32 @@ export function mcpProxy({
       log(JSON.stringify(message, null, 2))
 
       debugLog('Initialize message with modified client info', { clientInfo })
+
+      // Cache the (mutated) initialize so it can be replayed onto a rotated SSE session (#269).
+      lastInitialize = message
     }
 
+    sendToServer(message)
+  }
+
+  /**
+   * Forwards a client request/notification to the remote server.
+   *
+   * Fast path (the overwhelmingly common case): no recovery is in progress, so forward
+   * synchronously — identical to the pre-#269 behaviour.
+   *
+   * Gated path (issue #269): while an OAuth recovery or SSE re-initialize is in flight, wait for
+   * both to settle first so a normal request never races ahead of the fresh session handshake.
+   */
+  function sendToServer(message: Message): void {
+    if (!authRecoveryInFlight && !reinitInFlight) {
+      dispatchToServer(message)
+      return
+    }
+    void settleRecoveries().then(() => dispatchToServer(message))
+  }
+
+  function dispatchToServer(message: Message): void {
     lastOutboundRequest = message
     const requestId = 'id' in message ? message.id : undefined
     if (requestId !== undefined) {
@@ -537,6 +573,16 @@ export function mcpProxy({
   }
 
   transportToServer.onmessage = (_message) => {
+    // Responses to our own internal re-initialize handshake are ours to consume, never the
+    // client's (issue #269). They carry a sentinel id we minted in doReinitializeSession.
+    const reinitId = (_message as Message)?.id
+    if (typeof reinitId === 'string' && pendingReinit.has(reinitId)) {
+      const settle = pendingReinit.get(reinitId)!
+      pendingReinit.delete(reinitId)
+      settle(_message as Message)
+      return
+    }
+
     // TODO: fix types
     const message = messageTransformer.interceptResponse(_message as any)
     log('[Remote→Local]', message.method || message.id)
@@ -577,6 +623,14 @@ export function mcpProxy({
   transportToClient.onerror = onClientError
   transportToServer.onerror = onServerError
 
+  // Legacy SSE only (#269): when the EventSource reconnects onto a new session, replay the
+  // handshake. The stateless 2026-07-28 path uses StatelessHTTPTransport and is never wired here.
+  if (isReinitAwareSSETransport(transportToServer)) {
+    transportToServer.onSessionRotated = () => {
+      void handleSseSessionRotated()
+    }
+  }
+
   function onClientError(error: Error) {
     log('Error from local client:', error)
     debugLog('Error from local client', { stack: error.stack })
@@ -610,6 +664,13 @@ export function mcpProxy({
     log('Error from remote server:', error)
     debugLog('Error from remote server', { stack: error.stack })
     if (isRecoverableAuthError(error) && authInitializer) {
+      // While an SSE re-initialize is running, it owns auth recovery. Ensure the OAuth flow is
+      // (single-flight) running so the reinit handshake can resume, but do NOT start a competing
+      // normal-request retry here — normal requests are gated behind settleRecoveries (#269).
+      if (reinitInFlight) {
+        void ensureAuthRecovered()
+        return
+      }
       void onSendError(error, lastOutboundRequest)
       return
     }
@@ -628,25 +689,15 @@ export function mcpProxy({
     })
   }
 
-  async function onSendError(error: Error, failedMessage?: Message) {
-    if (!isRecoverableAuthError(error) || !authInitializer) {
-      return
-    }
-
-    if (authRecoveryInFlight) {
-      await authRecoveryInFlight
-      if (failedMessage) {
-        try {
-          await transportToServer.send(failedMessage)
-        } catch (retryError) {
-          await replyAuthErrorToClient(
-            failedMessage,
-            retryError instanceof Error ? retryError.message : 'MCP authentication failed after re-sign-in',
-          )
-        }
-      }
-      return
-    }
+  /**
+   * Single-flight OAuth recovery core: invalidate stale tokens, run the auth flow, and finish it
+   * on the transport. Does NOT retry any application message — that stays the caller's concern so
+   * this primitive can be shared by both the normal-request path (onSendError) and the SSE
+   * re-initialize path (doReinitializeSession) without duplicating a handshake.
+   */
+  function ensureAuthRecovered(): Promise<void> {
+    if (!authInitializer) return Promise.resolve()
+    if (authRecoveryInFlight) return authRecoveryInFlight
 
     authRecoveryInFlight = (async () => {
       log('Authentication required during active session — clearing stale tokens and re-authenticating...')
@@ -657,7 +708,7 @@ export function mcpProxy({
       }
       events?.emit('reset-auth-code')
 
-      debugLog('onSendError: Calling authInitializer to start auth flow')
+      debugLog('ensureAuthRecovered: Calling authInitializer to start auth flow')
       const authState = await authInitializer(true)
 
       if (!authState.skipBrowserAuth && callbackPort) {
@@ -675,28 +726,32 @@ export function mcpProxy({
         log('Authentication required. Waiting for authorization...')
       }
 
-      debugLog('onSendError: Waiting for auth code from callback server')
+      debugLog('ensureAuthRecovered: Waiting for auth code from callback server')
       const code = await authState.waitForAuthCode()
-      debugLog('onSendError: Received auth code from callback server')
+      debugLog('ensureAuthRecovered: Received auth code from callback server')
 
-      log('onSendError: Completing authorization...')
+      log('ensureAuthRecovered: Completing authorization...')
       resetTransportAuthState(transportToServer)
       if ('finishAuth' in transportToServer && typeof transportToServer.finishAuth === 'function') {
         await transportToServer.finishAuth(code)
-        log('onSendError: Authorization completed successfully')
+        log('ensureAuthRecovered: Authorization completed successfully')
       } else {
         throw new Error('Transport does not support finishAuth')
       }
-    })()
+    })().finally(() => {
+      authRecoveryInFlight = null
+    })
+
+    return authRecoveryInFlight
+  }
+
+  async function onSendError(error: Error, failedMessage?: Message) {
+    if (!isRecoverableAuthError(error) || !authInitializer) {
+      return
+    }
 
     try {
-      await authRecoveryInFlight
-      resetTransportAuthState(transportToServer)
-      if (failedMessage) {
-        log('onSendError: Retrying failed message after re-authentication')
-        await transportToServer.send(failedMessage)
-        log('onSendError: Message successfully sent after re-authentication')
-      }
+      await ensureAuthRecovered()
     } catch (authError) {
       log('onSendError: Error completing authorization:', authError)
       await replyAuthErrorToClient(
@@ -705,9 +760,121 @@ export function mcpProxy({
           ? authError.message
           : 'MCP OAuth session expired — sign in again in your browser',
       )
-    } finally {
-      authRecoveryInFlight = null
+      return
     }
+
+    resetTransportAuthState(transportToServer)
+    // Ordering (#269): if an SSE re-initialize is also in flight, let it finish so the retried
+    // request lands on the fresh, initialized session rather than racing ahead of the handshake.
+    await reinitInFlight?.catch(() => {})
+
+    if (failedMessage) {
+      try {
+        log('onSendError: Retrying failed message after re-authentication')
+        await transportToServer.send(failedMessage)
+        log('onSendError: Message successfully sent after re-authentication')
+      } catch (retryError) {
+        await replyAuthErrorToClient(
+          failedMessage,
+          retryError instanceof Error ? retryError.message : 'MCP authentication failed after re-sign-in',
+        )
+      }
+    }
+  }
+
+  // --- Legacy SSE session recovery (issue #269) ---
+
+  /** Waits for any in-flight OAuth recovery and SSE re-initialize to settle, in that precedence. */
+  async function settleRecoveries(): Promise<void> {
+    // Loop because a reinit may begin (and itself start OAuth recovery) after we first observe it.
+    // Both promises are single-flight, so this settles.
+    while (authRecoveryInFlight || reinitInFlight) {
+      await authRecoveryInFlight?.catch(() => {})
+      await reinitInFlight?.catch(() => {})
+    }
+  }
+
+  /** The new session negotiates its own protocol version; the header must follow it. */
+  function applyNegotiatedProtocolVersion(response: Message): void {
+    const protocolVersion = response?.result?.protocolVersion
+    if (typeof protocolVersion === 'string') {
+      debugLog('Applying negotiated protocol version after SSE reinit', { protocolVersion })
+      ;(transportToServer as { setProtocolVersion?: (version: string) => void }).setProtocolVersion?.(protocolVersion)
+    }
+  }
+
+  function handleSseSessionRotated(): Promise<void> {
+    if (!lastInitialize) {
+      debugLog('SSE session rotated but no cached initialize seen; skipping re-initialize')
+      return Promise.resolve()
+    }
+    return reinitializeSession().catch((error) => {
+      // Log-only: never feed this back into onServerError, or we could spawn a competing recovery.
+      log('SSE re-initialize failed:', error instanceof Error ? error.message : String(error))
+      debugLog('SSE re-initialize failed', { error })
+    })
+  }
+
+  /** Coalesces concurrent rotations/requests so a dead session produces exactly one new session. */
+  function reinitializeSession(): Promise<void> {
+    if (!reinitInFlight) {
+      reinitInFlight = doReinitializeSession().finally(() => {
+        reinitInFlight = null
+      })
+    }
+    return reinitInFlight
+  }
+
+  async function doReinitializeSession(): Promise<void> {
+    if (!lastInitialize) {
+      throw new Error('No cached initialize request; cannot re-establish the SSE session')
+    }
+
+    // Never replay the handshake on a token OAuth is mid-way through refreshing.
+    await authRecoveryInFlight?.catch(() => {})
+
+    try {
+      await sendReinitHandshake()
+      return
+    } catch (error) {
+      // A recoverable auth error means the fresh session needs (re-)authentication. Reuse any
+      // OAuth recovery already started by the transport's onerror, then retry the handshake once.
+      if (!isRecoverableAuthError(error as Error) || !authInitializer) {
+        throw error
+      }
+      log('SSE re-initialize hit an auth error; recovering OAuth then retrying handshake once')
+      await ensureAuthRecovered()
+      resetTransportAuthState(transportToServer)
+      await sendReinitHandshake()
+    }
+  }
+
+  async function sendReinitHandshake(): Promise<void> {
+    const id = `mcp-remote-reinit-${++reinitSeq}`
+    const response = await new Promise<Message>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingReinit.delete(id)
+        reject(new Error('Timed out waiting for the re-initialize response'))
+      }, 30000)
+      pendingReinit.set(id, (message) => {
+        clearTimeout(timer)
+        resolve(message)
+      })
+      transportToServer.send({ ...lastInitialize, id }).catch((error) => {
+        clearTimeout(timer)
+        pendingReinit.delete(id)
+        reject(error)
+      })
+    })
+
+    if (response.error) {
+      throw new Error(`Server rejected re-initialize: ${JSON.stringify(response.error)}`)
+    }
+
+    applyNegotiatedProtocolVersion(response)
+    // The SDK only (re)opens the standalone GET SSE stream when it sees this notification.
+    await transportToServer.send({ jsonrpc: '2.0', method: 'notifications/initialized' })
+    log('Re-established SSE session after endpoint rotation (issue #269)')
   }
 }
 
@@ -991,7 +1158,7 @@ export async function connectToRemoteServer(
   // Create transport instance based on the strategy
   const sseTransport = transportStrategy === 'sse-only' || transportStrategy === 'sse-first'
   const transport = sseTransport
-    ? new SSEClientTransport(url, {
+    ? new ReinitAwareSSEClientTransport(url, {
         authProvider,
         requestInit: { headers },
         eventSourceInit,
