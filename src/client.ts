@@ -27,6 +27,7 @@ import {
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { StatelessHTTPTransport } from './lib/stateless-http-transport'
 import { createLazyAuthCoordinator } from './lib/coordination'
+import { attachClientDiagnostics } from './lib/client-diagnostics'
 
 /**
  * Main function to run the client
@@ -148,19 +149,11 @@ async function runClient(
       return
     }
 
-    // Set up message and error handlers
-    transport.onmessage = (message) => {
-      log('Received message:', JSON.stringify(message, null, 2))
-    }
-
-    transport.onerror = (error) => {
-      log('Transport error:', error)
-    }
-
-    transport.onclose = () => {
-      log('Connection closed.')
-      process.exit(0)
-    }
+    // Attach diagnostics WITHOUT displacing the SDK response dispatcher that
+    // Client.connect() installed on transport.onmessage (issue #324). This
+    // preserves "Received message" logging and close/error diagnostics while
+    // still letting client.request(...) settle normally.
+    attachClientDiagnostics(client, transport)
 
     // Set up cleanup handler
     const cleanup = async () => {
