@@ -156,6 +156,59 @@ async function registerPrimary(
   }
 }
 
+/** How long a secondary waits for the primary to persist its tokens, and how often it checks. */
+export const TOKEN_HANDOFF_TIMEOUT_MS = 30_000
+export const TOKEN_HANDOFF_POLL_INTERVAL_MS = 200
+
+/**
+ * Waits until the primary instance's OAuth tokens are actually persisted and readable.
+ *
+ * Coordination reports "completed" as soon as the primary's callback server *received* the
+ * authorization code — strictly earlier than that code being exchanged and the tokens written to
+ * disk. A secondary that proceeds in that window reads no tokens and 401s (issue #322). Rather
+ * than sleeping a fixed guess, poll the real token store until the tokens land, short-circuiting
+ * immediately once they do and giving up after `timeoutMs`.
+ *
+ * The check is injected (not a second file reader) so the caller polls the exact same source of
+ * truth the transport later reads — the proxy passes `authProvider.tokens()`.
+ *
+ * @param hasPersistedTokens Reads the shared token store; resolves truthy once tokens are readable
+ * @param timeoutMs Overall give-up budget (default 30s)
+ * @param intervalMs Poll interval between checks (default 200ms)
+ * @returns True if tokens became readable before the timeout, false if the budget elapsed first
+ */
+export async function waitForPrimaryTokens(
+  hasPersistedTokens: () => Promise<boolean>,
+  timeoutMs: number = TOKEN_HANDOFF_TIMEOUT_MS,
+  intervalMs: number = TOKEN_HANDOFF_POLL_INTERVAL_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+
+  while (true) {
+    let present = false
+    try {
+      present = await hasPersistedTokens()
+    } catch (error) {
+      // A transient read error (file mid-write, momentarily unavailable) is treated as "not yet";
+      // keep polling until the deadline rather than giving up on one failed read.
+      debugLog('Token handoff check failed; will retry', { error })
+      present = false
+    }
+
+    if (present) {
+      debugLog('Primary instance tokens are persisted and readable')
+      return true
+    }
+
+    if (Date.now() >= deadline) {
+      log(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the primary instance to persist its tokens`)
+      return false
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+  }
+}
+
 /**
  * Creates a lazy auth coordinator that will only initiate auth when needed
  * @param serverUrlHash The hash of the server URL
@@ -224,11 +277,14 @@ function makeSecondaryResult(): PrimaryHandlers {
   const dummyPort = (dummyServer.address() as AddressInfo).port
   debugLog('Started dummy server for secondary instance', { port: dummyPort })
 
-  // This shouldn't actually be called in normal operation, but provide it for API compatibility.
+  // Never awaited in normal operation: callers branch on skipBrowserAuth and reconnect using the
+  // tokens the primary wrote to disk. Reject rather than return a promise that never settles, so a
+  // caller that does reach it fails fast instead of hanging until the MCP host times out (#322).
   const dummyWaitForAuthCode = () => {
     log('WARNING: waitForAuthCode called in secondary instance - this is unexpected')
-    // Return a promise that never resolves - the client should use the tokens from disk instead.
-    return new Promise<string>(() => {})
+    return Promise.reject(
+      new Error('waitForAuthCode is not available in a secondary instance; reconnect using the tokens on disk instead'),
+    )
   }
 
   return {

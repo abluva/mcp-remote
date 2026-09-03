@@ -1140,9 +1140,32 @@ export async function connectToRemoteServer(
           await waitForCallbackServer(authCallbackPort)
         }
 
-        if (!skipBrowserAuth) {
-          log('Authentication required. Waiting for authorization...')
+        // A concurrent instance completed the browser flow and persisted the tokens. We have no
+        // authorization code of our own to exchange (our callback server never received one, and
+        // the sibling's code is already redeemed), so reconnect and let the auth provider re-read
+        // the sibling's tokens from disk rather than await a code that never arrives (#322).
+        // Bounded once via recursionReasons so a token that still does not work does not loop.
+        if (skipBrowserAuth) {
+          if (recursionReasons.has(REASON_AUTH_NEEDED)) {
+            const errorMessage = `Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`
+            log(errorMessage)
+            throw new Error(errorMessage)
+          }
+          recursionReasons.add(REASON_AUTH_NEEDED)
+          log('Authentication completed by another instance - reconnecting with the tokens it wrote')
+          return connectToRemoteServer(
+            client,
+            serverUrl,
+            authProvider,
+            headers,
+            authInitializer,
+            transportStrategy,
+            recursionReasons,
+            PROTOCOL_2026_07_28,
+          )
         }
+
+        log('Authentication required. Waiting for authorization...')
 
         const code = await waitForAuthCode()
         try {
@@ -1352,11 +1375,32 @@ export async function connectToRemoteServer(
         await waitForCallbackServer(authCallbackPort)
       }
 
+      // A concurrent instance completed the browser flow and persisted the tokens. We have no
+      // authorization code of our own to exchange (our callback server never received one, and the
+      // sibling's code is already redeemed), so reconnect and let the auth provider re-read the
+      // sibling's tokens from disk rather than await a code that never arrives (#322). Bounded once
+      // via recursionReasons so a token that still does not work does not loop.
       if (skipBrowserAuth) {
-        log('Authentication required but skipping browser auth - using shared auth')
-      } else {
-        log('Authentication required. Waiting for authorization...')
+        if (recursionReasons.has(REASON_AUTH_NEEDED)) {
+          const errorMessage = `Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`
+          log(errorMessage)
+          throw new Error(errorMessage)
+        }
+        recursionReasons.add(REASON_AUTH_NEEDED)
+        log('Authentication completed by another instance - reconnecting with the tokens it wrote')
+        return connectToRemoteServer(
+          client,
+          serverUrl,
+          authProvider,
+          headers,
+          authInitializer,
+          transportStrategy,
+          recursionReasons,
+          protocolMode,
+        )
       }
+
+      log('Authentication required. Waiting for authorization...')
 
       // Wait for the authorization code from the callback
       debugLog('Waiting for auth code from callback server')

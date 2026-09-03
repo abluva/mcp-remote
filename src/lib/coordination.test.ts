@@ -5,7 +5,7 @@ import os from 'os'
 import path from 'path'
 import fs from 'fs'
 import type { Server } from 'http'
-import { coordinateAuth } from './coordination'
+import { coordinateAuth, waitForPrimaryTokens } from './coordination'
 import { calculateFallbackPort, findAvailablePort, getServerUrlHash } from './utils'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 
@@ -274,4 +274,100 @@ describe('coordinateAuth — cross-process OAuth election (Issue #17)', () => {
     expect(tokens?.access_token).toBe('tok-abc')
     expect(tokens?.refresh_token).toBe('ref-xyz')
   }, 25000)
+
+  it('a secondary waitForAuthCode() rejects instead of hanging forever (#322)', async () => {
+    const hash = getServerUrlHash('https://dummy-reject.example.com/mcp')
+    const port = await findAvailablePort()
+
+    const primary = await coordinateAuth(hash, port, new EventEmitter(), 5000)
+    track(primary.server)
+    expect(primary.skipBrowserAuth).toBe(false)
+
+    // A concurrent secondary; complete the primary's callback so it resolves as 'completed'.
+    const secondaryPromise = coordinateAuth(hash, port, new EventEmitter(), 5000)
+    await fetch(`http://127.0.0.1:${port}/oauth/callback?code=code-for-primary`).catch(() => {})
+    const secondary = await secondaryPromise
+    track(secondary.server)
+    expect(secondary.skipBrowserAuth).toBe(true)
+
+    // The secondary must never hand back a code: waitForAuthCode rejects rather than returning a
+    // promise that never settles (which previously blocked until the MCP host timed out). (#322)
+    await expect(secondary.waitForAuthCode()).rejects.toThrow(/secondary instance/i)
+  }, 15000)
+})
+
+/**
+ * Regression tests for Issue #322 — secondary token handoff.
+ *
+ * `waitForPrimaryTokens` polls the real token store (injected as `authProvider.tokens()` in the
+ * proxy) so a secondary proceeds only once the primary has actually persisted its tokens, rather
+ * than gambling on a fixed ~1s sleep that could race a slow token exchange.
+ */
+describe('waitForPrimaryTokens — secondary token handoff (Issue #322)', () => {
+  it('Scenario: Token already present → returns immediately', async () => {
+    const start = Date.now()
+    const result = await waitForPrimaryTokens(async () => true, 30_000, 200)
+    const elapsed = Date.now() - start
+
+    expect(result).toBe(true)
+    // Short-circuits on the first check without sleeping a poll interval
+    expect(elapsed).toBeLessThan(100)
+  })
+
+  it('Scenario: Token appears after a short delay → waits only until it appears', async () => {
+    const appearAt = Date.now() + 120
+    const start = Date.now()
+    const result = await waitForPrimaryTokens(async () => Date.now() >= appearAt, 5_000, 50)
+    const elapsed = Date.now() - start
+
+    expect(result).toBe(true)
+    expect(elapsed).toBeGreaterThanOrEqual(100)
+    expect(elapsed).toBeLessThan(1_000)
+  })
+
+  it('Scenario: Token appears after more than 1 second → still succeeds (old 1s race fixed)', async () => {
+    const appearAt = Date.now() + 1_300
+    const start = Date.now()
+    const result = await waitForPrimaryTokens(async () => Date.now() >= appearAt, 30_000, 200)
+    const elapsed = Date.now() - start
+
+    expect(result).toBe(true)
+    // The old fixed 1s handoff would have proceeded here with no token; the poll waits past 1s.
+    expect(elapsed).toBeGreaterThan(1_000)
+    expect(elapsed).toBeLessThan(5_000)
+  }, 10_000)
+
+  it('Scenario: Token never appears → stops after the overall timeout, not forever', async () => {
+    const start = Date.now()
+    const result = await waitForPrimaryTokens(async () => false, 400, 50)
+    const elapsed = Date.now() - start
+
+    expect(result).toBe(false)
+    expect(elapsed).toBeGreaterThanOrEqual(400)
+    // Bounded: proves no unbounded wait was introduced
+    expect(elapsed).toBeLessThan(2_000)
+  })
+
+  it('Scenario: A transient read error is tolerated and polling continues', async () => {
+    let calls = 0
+    const result = await waitForPrimaryTokens(
+      async () => {
+        calls++
+        if (calls === 1) throw new Error('temporarily unavailable (mid-write)')
+        return calls >= 3 // false on 2nd check, true on 3rd
+      },
+      5_000,
+      50,
+    )
+
+    expect(result).toBe(true)
+    expect(calls).toBeGreaterThanOrEqual(3)
+  })
+
+  it('Scenario: Token that appears on the last interval before the deadline is still caught', async () => {
+    const appearAt = Date.now() + 260
+    const result = await waitForPrimaryTokens(async () => Date.now() >= appearAt, 400, 100)
+
+    expect(result).toBe(true)
+  })
 })

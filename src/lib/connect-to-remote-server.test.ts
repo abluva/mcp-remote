@@ -328,4 +328,44 @@ describe('connectToRemoteServer', () => {
     expect(invalidateCredentials).toHaveBeenCalledTimes(1)
     expect(connectCalls).toBe(2)
   })
+
+  it('reconnects with the sibling tokens instead of awaiting a code when skipBrowserAuth (regression: #322)', async () => {
+    // A secondary instance: another process ran the browser flow and persisted tokens. There is no
+    // authorization code of our own to await, so we must reconnect (re-read disk tokens), not hang.
+    const waitForAuthCode = vi.fn().mockRejectedValue(new Error('waitForAuthCode must not be awaited for a secondary'))
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode, skipBrowserAuth: true, callbackPort: 0 })
+    mockState.connectFailuresRemaining = 1
+    mockState.connectError = new Error('Unauthorized')
+
+    const transport = await connectToRemoteServer(
+      null,
+      'https://mcp.example.com/mcp',
+      {} as any,
+      {},
+      authInitializer,
+      'http-first',
+      new Set(),
+      'legacy',
+    )
+
+    expect(transport).toBeDefined()
+    // The secondary reconnected and used the sibling's tokens — never awaited a code, never finished auth.
+    expect(waitForAuthCode).not.toHaveBeenCalled()
+    for (const t of mockState.httpTransports) expect(t.finishAuth).not.toHaveBeenCalled()
+  })
+
+  it('gives up after one reconnect when the sibling tokens still fail, without awaiting a code (regression: #322)', async () => {
+    // Server keeps rejecting even after reading the sibling's tokens: bounded to a single reconnect,
+    // then a clear error — never an unbounded wait on the secondary dummy waitForAuthCode.
+    const waitForAuthCode = vi.fn().mockRejectedValue(new Error('waitForAuthCode must not be awaited for a secondary'))
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode, skipBrowserAuth: true, callbackPort: 0 })
+    mockState.connectFailuresRemaining = Number.MAX_SAFE_INTEGER
+    mockState.connectError = new Error('Unauthorized')
+
+    await expect(
+      connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first', new Set(), 'legacy'),
+    ).rejects.toThrow(/Already attempted reconnection/)
+
+    expect(waitForAuthCode).not.toHaveBeenCalled()
+  })
 })

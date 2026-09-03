@@ -29,7 +29,7 @@ import {
 } from './lib/utils'
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
-import { createLazyAuthCoordinator } from './lib/coordination'
+import { createLazyAuthCoordinator, waitForPrimaryTokens } from './lib/coordination'
 import { StatelessHTTPTransport } from './lib/stateless-http-transport'
 
 /**
@@ -168,8 +168,16 @@ async function runProxy(
     authProvider.setCallbackPort(effectiveCallbackPort)
 
     if (authState.skipBrowserAuth) {
-      log('Authentication was completed by another instance - will use tokens from disk')
-      await new Promise((res) => setTimeout(res, 1_000))
+      log('Authentication was completed by another instance - waiting for its tokens to be persisted')
+      // The callback fires before the primary exchanges the code and writes tokens.json, so a fixed
+      // sleep can race a slow token exchange (issue #322). Poll the same token store the transport
+      // reads (authProvider.tokens()) and proceed as soon as the tokens are actually readable.
+      const tokensReady = await waitForPrimaryTokens(async () => Boolean(await authProvider.tokens()))
+      if (tokensReady) {
+        log('Tokens from the other instance are available - using tokens from disk')
+      } else {
+        log('Proceeding without confirmed tokens from the other instance; reconnect may re-trigger auth')
+      }
     }
 
     return {

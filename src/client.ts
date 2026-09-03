@@ -26,7 +26,7 @@ import {
 } from './lib/utils'
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { StatelessHTTPTransport } from './lib/stateless-http-transport'
-import { createLazyAuthCoordinator } from './lib/coordination'
+import { createLazyAuthCoordinator, waitForPrimaryTokens } from './lib/coordination'
 import { attachClientDiagnostics } from './lib/client-diagnostics'
 
 /**
@@ -102,12 +102,18 @@ async function runClient(
     // Store server in outer scope for cleanup
     server = authState.server
 
-    // If auth was completed by another instance, just log that we'll use the auth from disk
+    // If auth was completed by another instance, wait for its tokens to actually be persisted.
+    // The callback fires before the primary exchanges the code and writes tokens.json, so a fixed
+    // sleep can race a slow token exchange (issue #322). Poll the same token store the transport
+    // reads (authProvider.tokens()) and proceed as soon as the tokens are actually readable.
     if (authState.skipBrowserAuth) {
-      log('Authentication was completed by another instance - will use tokens from disk...')
-      // TODO: remove, the callback is happening before the tokens are exchanged
-      //  so we're slightly too early
-      await new Promise((res) => setTimeout(res, 1_000))
+      log('Authentication was completed by another instance - waiting for its tokens to be persisted')
+      const tokensReady = await waitForPrimaryTokens(async () => Boolean(await authProvider.tokens()))
+      if (tokensReady) {
+        log('Tokens from the other instance are available - using tokens from disk')
+      } else {
+        log('Proceeding without confirmed tokens from the other instance; reconnect may re-trigger auth')
+      }
     }
 
     return {
