@@ -3,6 +3,7 @@ import {
   parseCommandLineArgs,
   shouldIncludeTool,
   mcpProxy,
+  createMessageTransformer,
   setupOAuthCallbackServerWithLongPoll,
   getServerUrlHash,
   mergeHeaders,
@@ -568,7 +569,82 @@ describe('Feature: Tool Filtering with Ignore Patterns', () => {
   })
 })
 
+describe('Feature: createMessageTransformer robustness (#310)', () => {
+  it('Scenario: A throwing request transform forwards the original request unchanged', () => {
+    const transformer = createMessageTransformer({
+      transformRequestFunction: () => {
+        throw new Error('boom')
+      },
+    })
+    const request = { jsonrpc: '2.0', id: 1, method: 'tools/list' }
+    // Delivery is not swallowed: the original request comes back out
+    expect(transformer.interceptRequest(request as any)).toBe(request)
+  })
+
+  it('Scenario: A throwing response transform forwards the original response unchanged', () => {
+    const transformer = createMessageTransformer({
+      transformResponseFunction: () => {
+        throw new Error('boom')
+      },
+    })
+    const request = { jsonrpc: '2.0', id: 1, method: 'tools/list' }
+    transformer.interceptRequest(request as any)
+    const response = { jsonrpc: '2.0', id: 1, result: { tools: [] } }
+    expect(transformer.interceptResponse(response as any)).toBe(response)
+  })
+
+  it('Scenario: A notification with no id is not tracked as a request', () => {
+    const pairedRequests: any[] = []
+    const transformer = createMessageTransformer({
+      transformResponseFunction: (req, res) => {
+        pairedRequests.push(req)
+        return res
+      },
+    })
+    transformer.interceptRequest({ jsonrpc: '2.0', method: 'notifications/initialized' } as any)
+    // A later response reusing id 1 must not pair with the untracked notification
+    const response = { jsonrpc: '2.0', id: 1, result: {} }
+    expect(transformer.interceptResponse(response as any)).toBe(response)
+    expect(pairedRequests).toEqual([])
+  })
+
+  it('Scenario: id 0, numeric, and string ids are all tracked and transformed', () => {
+    for (const id of [0, 7, 'abc'] as const) {
+      const transformer = createMessageTransformer({
+        transformResponseFunction: (_req, res) => ({ ...res, tagged: true }),
+      })
+      transformer.interceptRequest({ jsonrpc: '2.0', id, method: 'tools/list' } as any)
+      const out = transformer.interceptResponse({ jsonrpc: '2.0', id, result: {} } as any)
+      expect(out.tagged).toBe(true)
+    }
+  })
+
+  it('Scenario: A server-initiated request does not consume pending client state (unit level)', () => {
+    const transformer = createMessageTransformer({
+      transformResponseFunction: (_req, res) => ({ ...res, filtered: true }),
+    })
+    transformer.interceptRequest({ jsonrpc: '2.0', id: 1, method: 'tools/list' } as any)
+    // A server-initiated request that reuses id 1 arrives on the response path: it has a method,
+    // so it is not a response and must be forwarded untouched without consuming the pending entry.
+    const serverRequest = { jsonrpc: '2.0', id: 1, method: 'ping' }
+    expect(transformer.interceptResponse(serverRequest as any)).toBe(serverRequest)
+    // The client's real answer still pairs with the pending request and is transformed
+    const realResponse = { jsonrpc: '2.0', id: 1, result: {} }
+    expect((transformer.interceptResponse(realResponse as any) as any).filtered).toBe(true)
+  })
+})
+
 describe('Feature: MCP Proxy', () => {
+  const mockTransport = () =>
+    ({
+      send: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn().mockResolvedValue(undefined),
+      onmessage: vi.fn(),
+      onclose: vi.fn(),
+      onerror: vi.fn(),
+    }) as unknown as Transport
+
   it('Scenario: Proxy initialize message from client to server', async () => {
     // Given mock transports for client and server
     const mockTransportToClient = {
@@ -867,6 +943,263 @@ describe('Feature: MCP Proxy', () => {
         },
       }),
     )
+  })
+
+  it('Scenario: Forward an error response to tools/list instead of dropping it (#310)', async () => {
+    // Given a proxy between mock transports
+    const mockTransportToClient = mockTransport()
+    const mockTransportToServer = mockTransport()
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: ['delete*'],
+    })
+
+    // And a tools/list request from the client
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', id: 2, method: 'tools/list' } as any)
+
+    // When the server answers it with a JSON-RPC error rather than a result
+    mockTransportToServer.onmessage!({
+      jsonrpc: '2.0',
+      id: 2,
+      error: { code: -32600, message: 'Session not initialized' },
+    } as any)
+
+    // Then the error reaches the client, rather than the request going unanswered
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 2,
+        error: { code: -32600, message: 'Session not initialized' },
+      }),
+    )
+  })
+
+  it('Scenario: Forward a tools/list result that carries no tools (#310)', async () => {
+    // Given a proxy between mock transports
+    const mockTransportToClient = mockTransport()
+    const mockTransportToServer = mockTransport()
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: ['delete*'],
+    })
+
+    // And a tools/list request from the client
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', id: 3, method: 'tools/list' } as any)
+
+    // When the server answers with a result that omits the tools array
+    mockTransportToServer.onmessage!({ jsonrpc: '2.0', id: 3, result: {} } as any)
+
+    // Then the result is forwarded untouched (no crash, no dropped response)
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(expect.objectContaining({ id: 3, result: {} }))
+  })
+
+  it('Scenario: Forward a tools/list result whose tools field is not an array (#310)', async () => {
+    // Given a proxy between mock transports
+    const mockTransportToClient = mockTransport()
+    const mockTransportToServer = mockTransport()
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: ['delete*'],
+    })
+
+    // And a tools/list request from the client
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', id: 4, method: 'tools/list' } as any)
+
+    // When the server answers with a non-array tools field (would have thrown on .filter pre-fix)
+    mockTransportToServer.onmessage!({ jsonrpc: '2.0', id: 4, result: { tools: { unexpected: true } } } as any)
+
+    // Then the result is forwarded untouched rather than crashing the forward
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 4, result: { tools: { unexpected: true } } }),
+    )
+  })
+
+  it('Scenario: The initialized barrier releases queued requests after the 10s timeout (#310)', async () => {
+    // Given a server that never acknowledges notifications/initialized
+    vi.useFakeTimers()
+    try {
+      const mockTransportToClient = mockTransport()
+      const sent: string[] = []
+      const mockTransportToServer = {
+        ...mockTransport(),
+        send: vi.fn().mockImplementation((message: any) => {
+          if (message.method === 'notifications/initialized') {
+            return new Promise<void>(() => {}) // never settles
+          }
+          sent.push(message.method ?? String(message.id))
+          return Promise.resolve()
+        }),
+      } as unknown as Transport
+
+      mcpProxy({
+        transportToClient: mockTransportToClient,
+        transportToServer: mockTransportToServer,
+        ignoredTools: [],
+      })
+
+      // When the client sends the notification (which the server never acks) then a request
+      mockTransportToClient.onmessage!({ jsonrpc: '2.0', method: 'notifications/initialized' } as any)
+      mockTransportToClient.onmessage!({ jsonrpc: '2.0', id: 1, method: 'tools/list' } as any)
+
+      // Then the request stays queued while under the bound...
+      await vi.advanceTimersByTimeAsync(9_000)
+      expect(sent).toEqual([])
+
+      // ...and is released (rather than hanging forever) once the 10s bound elapses
+      await vi.advanceTimersByTimeAsync(1_500)
+      expect(sent).toEqual(['tools/list'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('Scenario: After initialization, two normal requests are not serialized behind each other (#310)', async () => {
+    // Given a proxy whose first forwarded request never settles at the server
+    const mockTransportToClient = mockTransport()
+    const started: string[] = []
+    let releaseFirst: () => void = () => {}
+    const mockTransportToServer = {
+      ...mockTransport(),
+      send: vi.fn().mockImplementation((message: any) => {
+        started.push(message.method ?? String(message.id))
+        if (message.id === 1) {
+          return new Promise<void>((resolve) => {
+            releaseFirst = resolve
+          })
+        }
+        return Promise.resolve()
+      }),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    // And startup has settled (barrier resolved)
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', method: 'notifications/initialized' } as any)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    // When two normal requests are sent and the first one's send is still in flight
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'a' } } as any)
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'b' } } as any)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    // Then the second request still reached the server; it was not blocked behind the first
+    expect(started.filter((m) => m === 'tools/call')).toHaveLength(2)
+    releaseFirst()
+  })
+
+  it('Scenario: A tools/list request with id 0 still goes through the transformer (#310)', async () => {
+    // Given a proxy between mock transports
+    const mockTransportToClient = mockTransport()
+    const mockTransportToServer = mockTransport()
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: ['delete*'],
+    })
+
+    // And a tools/list request whose id is the JSON-RPC-legal value 0
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', id: 0, method: 'tools/list' } as any)
+
+    // When the server answers id 0 with a tool list that includes an ignored tool
+    mockTransportToServer.onmessage!({
+      jsonrpc: '2.0',
+      id: 0,
+      result: { tools: [{ name: 'deleteTask' }, { name: 'listTasks' }] },
+    } as any)
+
+    // Then id 0 is tracked and filtered like any other id, not bypassed
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 0,
+        result: { tools: [{ name: 'listTasks' }] },
+      }),
+    )
+  })
+
+  it('Scenario: A server-initiated request does not consume a pending request with the same id (#310)', async () => {
+    // Given a proxy between mock transports
+    const mockTransportToClient = mockTransport()
+    const mockTransportToServer = mockTransport()
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: ['delete*'],
+    })
+
+    // And an in-flight tools/list request from the client
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', id: 1, method: 'tools/list' } as any)
+
+    // When the server sends a request of its own that happens to reuse id 1 (the two directions
+    // number their requests independently)
+    mockTransportToServer.onmessage!({ jsonrpc: '2.0', id: 1, method: 'ping' } as any)
+
+    // Then the ping reaches the client untouched
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(expect.objectContaining({ id: 1, method: 'ping' }))
+
+    // And the client's request is still pending, so its real answer is filtered as configured
+    mockTransportToServer.onmessage!({
+      jsonrpc: '2.0',
+      id: 1,
+      result: { tools: [{ name: 'deleteTask' }, { name: 'listTasks' }] },
+    } as any)
+
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 1,
+        result: { tools: [{ name: 'listTasks' }] },
+      }),
+    )
+  })
+
+  it('Scenario: Requests wait for the initialized notification to be delivered (#310)', async () => {
+    // Given a server that takes a moment to accept the initialized notification
+    const mockTransportToClient = mockTransport()
+    const sent: string[] = []
+    let releaseInitialized: () => void = () => {}
+    const mockTransportToServer = {
+      ...mockTransport(),
+      send: vi.fn().mockImplementation(async (message: any) => {
+        if (message.method === 'notifications/initialized') {
+          await new Promise<void>((resolve) => {
+            releaseInitialized = resolve
+          })
+        }
+        sent.push(message.method ?? String(message.id))
+      }),
+    } as unknown as Transport
+
+    mcpProxy({
+      transportToClient: mockTransportToClient,
+      transportToServer: mockTransportToServer,
+      ignoredTools: [],
+    })
+
+    // When the client sends the notification and its first requests back to back.
+    // (Both methods below are forwarded to the remote; list methods such as resources/list are
+    // answered by a local shim in this fork and would never reach the server.)
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', method: 'notifications/initialized' } as any)
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', id: 1, method: 'tools/list' } as any)
+    mockTransportToClient.onmessage!({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'foo' } } as any)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    // Then neither request has been sent yet
+    expect(sent).toEqual([])
+
+    // And once the notification lands, they follow in the order the client sent them
+    releaseInitialized()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(sent).toEqual(['notifications/initialized', 'tools/list', 'tools/call'])
   })
 
   it('Scenario: Block tools/call for ignored tools with delete* filter', async () => {

@@ -205,6 +205,15 @@ type Message = any
 const MESSAGE_BLOCKED = Symbol('MessageBlocked')
 const isMessageBlocked = (value: any): value is typeof MESSAGE_BLOCKED => value === MESSAGE_BLOCKED
 
+/** How long the client's first requests wait on `notifications/initialized` before going anyway (#310). */
+const LIFECYCLE_BARRIER_TIMEOUT_MS = 10_000
+
+/** A timer that never keeps the process alive on its own. */
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms).unref?.()
+  })
+
 export function createMessageTransformer({
   transformRequestFunction,
   transformResponseFunction,
@@ -212,22 +221,51 @@ export function createMessageTransformer({
   transformRequestFunction?: null | ((request: Message) => Message | typeof MESSAGE_BLOCKED)
   transformResponseFunction?: null | ((request: Message, response: Message) => Message)
 } = {}) {
-  const pendingRequests = new Map<string, Message>()
+  const pendingRequests = new Map<string | number, Message>()
+
+  /**
+   * A request is the only thing worth remembering, and the only thing worth pairing a response to.
+   *
+   * Both directions carry id-bearing messages that are *not* requests — a response the client
+   * sends back to a server-initiated call, for one — and the two directions number their requests
+   * independently, so recording those would let one side's id collide with the other's and pair a
+   * response with a message that never asked for it. Using `!= null` (not a truthy test) keeps the
+   * JSON-RPC-legal id `0` tracked (see https://github.com/geelen/mcp-remote/issues/310).
+   */
+  const isRequest = (message: Message) => message?.id != null && message.method !== undefined
+  const isResponse = (message: Message) => message?.id != null && message.method === undefined
+
+  /**
+   * Runs a transform, falling back to the untouched message if it throws.
+   *
+   * A transform is a convenience; delivery is not. Letting one throw here would abort the
+   * `onmessage` handler that was about to forward the message, so a client would be left waiting
+   * on a request that was in fact answered (see https://github.com/geelen/mcp-remote/issues/310).
+   */
+  const applyTransform = (transform: () => Message, message: Message) => {
+    try {
+      return transform()
+    } catch (error) {
+      log('Error transforming message, forwarding it unchanged:', error)
+      debugLog('Message transform failed', { id: message?.id, method: message?.method, error })
+      return message
+    }
+  }
 
   const interceptRequest = (message: Message) => {
-    const messageId = message.id
-    if (!messageId) return message
-    pendingRequests.set(messageId, message)
-    return transformRequestFunction?.(message) ?? message
+    if (!isRequest(message)) return message
+    pendingRequests.set(message.id, message)
+    if (!transformRequestFunction) return message
+    return applyTransform(() => transformRequestFunction(message) ?? message, message)
   }
 
   const interceptResponse = (message: Message) => {
-    const messageId = message.id
-    if (!messageId) return message
-    const originalRequest = pendingRequests.get(messageId)
+    if (!isResponse(message)) return message
+    const originalRequest = pendingRequests.get(message.id)
     if (!originalRequest) return message
-    pendingRequests.delete(messageId)
-    return transformResponseFunction?.(originalRequest, message) ?? message
+    pendingRequests.delete(message.id)
+    if (!transformResponseFunction) return message
+    return applyTransform(() => transformResponseFunction(originalRequest, message) ?? message, message)
   }
 
   return {
@@ -474,6 +512,13 @@ export function mcpProxy({
   // waiting clients with JSON-RPC errors instead of hanging indefinitely.
   const pendingRequests = new Map<string | number, true>()
 
+  // --- Startup lifecycle barrier (issue #310) ---
+  // Set once the client's `notifications/initialized` has been forwarded; the client's first
+  // requests wait on this so a strict remote does not see tools/list before the session is
+  // initialized. Null until then, and never reset — post-startup this resolves immediately, so
+  // it gates ordering without serializing normal traffic.
+  let initializedDelivered: Promise<unknown> | null = null
+
   const messageTransformer = createMessageTransformer({
     transformRequestFunction: (request: Message) => {
       // Block tools/call for ignored tools
@@ -497,24 +542,31 @@ export function mcpProxy({
       return request
     },
     transformResponseFunction: (req: Message, res: Message) => {
-      let response = res
-      if (req.method === 'tools/list' && res.result?.tools) {
-        response = {
+      // Not every answer to tools/list carries a tool list: a JSON-RPC error response has no
+      // `result` at all, and a server may answer with a result that omits `tools` (or sends a
+      // non-array in its place). Only filter when there is actually an array to filter; otherwise
+      // forward the server's own answer, so the client gets the error/result the server sent
+      // rather than a dropped or crashed response (see issues #164 and #310).
+      const tools = req.method === 'tools/list' ? res.result?.tools : undefined
+      if (Array.isArray(tools)) {
+        return {
           ...res,
           result: {
-            ...(remoteProtocolMode === PROTOCOL_2026_07_28
-              ? stripStatelessWireMeta(res.result)
-              : res.result),
-            tools: res.result.tools.filter((tool: any) => shouldIncludeTool(ignoredTools, tool.name)),
+            ...(remoteProtocolMode === PROTOCOL_2026_07_28 ? stripStatelessWireMeta(res.result) : res.result),
+            tools: tools.filter((tool: any) => shouldIncludeTool(ignoredTools, tool.name)),
           },
         }
-      } else if (remoteProtocolMode === PROTOCOL_2026_07_28 && res.result) {
-        response = {
+      }
+
+      // No tool array to filter (tools/list error/no-tools, or any other response): preserve the
+      // Abluva stateless wire-meta strip, but never assume a tools array exists.
+      if (remoteProtocolMode === PROTOCOL_2026_07_28 && res.result) {
+        return {
           ...res,
           result: stripStatelessWireMeta(res.result),
         }
       }
-      return response
+      return res
     },
   })
 
@@ -614,7 +666,38 @@ export function mcpProxy({
       lastInitialize = message
     }
 
-    sendToServer(message)
+    forwardInOrder(message)
+  }
+
+  /**
+   * Forwards a message, keeping the client's first requests behind `notifications/initialized`.
+   *
+   * Every forward here is an independent POST, and a client sends the notification and its first
+   * requests back to back, so without this they race — and a strict remote answers whichever
+   * request wins with `-32600 Session not initialized`. The spec puts the same rule on the client,
+   * which it honours over stdio; only the proxy was re-ordering it on the wire (issue #310).
+   *
+   * This layers on top of the existing #269 gating rather than replacing it: `sendToServer` still
+   * waits out any in-flight OAuth/SSE recovery internally. Nothing else is serialized — once the
+   * notification has settled, `initializedDelivered` is already resolved, so later requests fan
+   * out through `sendToServer` without waiting on each other.
+   */
+  function forwardInOrder(message: Message): void {
+    if (message.method === 'notifications/initialized') {
+      // Bounded, because a server that never accepts the notification must not leave every later
+      // request queued behind it forever — racing ahead is the lesser failure.
+      initializedDelivered = Promise.race([sendToServer(message), sleep(LIFECYCLE_BARRIER_TIMEOUT_MS)])
+      return
+    }
+
+    if (initializedDelivered) {
+      // Continuations resume in the order they were queued, so this preserves the client's order
+      // among the messages waiting on the notification, not just their order relative to it.
+      void initializedDelivered.then(() => sendToServer(message))
+      return
+    }
+
+    void sendToServer(message)
   }
 
   /**
@@ -625,23 +708,25 @@ export function mcpProxy({
    *
    * Gated path (issue #269): while an OAuth recovery or SSE re-initialize is in flight, wait for
    * both to settle first so a normal request never races ahead of the fresh session handshake.
+   *
+   * Returns a promise that settles once the underlying send has settled (including any recovery
+   * wait), so the #310 lifecycle barrier can await delivery of `notifications/initialized`.
    */
-  function sendToServer(message: Message): void {
+  function sendToServer(message: Message): Promise<void> {
     if (!authRecoveryInFlight && !reinitInFlight) {
-      dispatchToServer(message)
-      return
+      return dispatchToServer(message)
     }
-    void settleRecoveries().then(() => dispatchToServer(message))
+    return settleRecoveries().then(() => dispatchToServer(message))
   }
 
-  function dispatchToServer(message: Message): void {
+  function dispatchToServer(message: Message): Promise<void> {
     lastOutboundRequest = message
     const requestId = 'id' in message ? message.id : undefined
     if (requestId !== undefined) {
       pendingRequests.set(requestId, true)
     }
 
-    transportToServer.send(message).catch((error: Error) => {
+    return transportToServer.send(message).catch((error: Error) => {
       if (requestId !== undefined) {
         pendingRequests.delete(requestId)
       }
