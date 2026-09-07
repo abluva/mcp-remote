@@ -38,6 +38,7 @@ These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/i
 | [#253](https://github.com/geelen/mcp-remote/issues/253) | Stale callback server → EADDRINUSE on reconnect | Bind retry + auto port selection + stale `client_info` invalidation ([#262](https://github.com/geelen/mcp-remote/pull/262) partial) |
 | [#306](https://github.com/geelen/mcp-remote/issues/306) | EADDRINUSE concurrent OAuth port collisions | Auto port resolution without explicit config (v0.1.40+); optional explicit port still supported |
 | [#301](https://github.com/geelen/mcp-remote/issues/301) | Authorize URL built from wrong origin | Authorization server metadata URL fix (from jacopoc branch) |
+| [abluva #17](https://github.com/abluva/mcp-remote/issues/17) | Concurrent OAuth when Claude spawns duplicate `mcp-remote` processes | Cross-process primary election via exclusive callback-port bind; secondary token handoff; gated stale-registration invalidation |
 
 ---
 
@@ -77,6 +78,14 @@ These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/i
 | **MCP 2026-07-28 stateless** | `--protocol auto\|legacy\|2026-07-28`; POST-only remote transport; stdio bridge shims for Claude | 2.0.0+ |
 | **Local dev OAuth skip** | Skip OAuth callback server for `http://127.0.0.1` / `localhost` MCP URLs | 2.0.0+ |
 | **npm packaging** | Scoped package `@abluva/mcp-remote`, `prepack` build, public publishConfig | 0.1.39+ |
+| **Cross-process OAuth coordination (#17)** | Exactly one OAuth primary per `serverUrlHash`; secondaries wait for primary tokens instead of racing callback / `code_verifier` writes | 2.1.0+ |
+| **Secondary token handoff** | Non-primary processes poll primary lockfile and reuse issued tokens | 2.1.0+ |
+| **Stale dynamic client registration** | Detect invalid `client_id` at token exchange; re-register only when this process owns OAuth coordination | 2.1.0+ |
+| **OAuth discovery without compression** | Disable `Accept-Encoding` on RFC 9728 metadata fetches (some gateways break compressed discovery) | 2.1.0+ |
+| **SSE reconnect resilience** | `ReinitAwareSSETransport` re-runs `initialize` after reconnect; preserve SDK headers across SSE sessions | 2.1.0+ |
+| **HTTP transport metadata** | Preserve MCP method metadata and startup ordering through the stdio ↔ HTTP proxy | 2.1.0+ |
+| **Header redaction in logs** | Custom header values (e.g. agent keys) redacted in debug output | 2.1.0+ |
+| **No-auth server fast path** | Skip eager OAuth coordination when remote is reachable without auth | 2.1.0+ |
 
 ---
 
@@ -90,6 +99,7 @@ These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/i
 | **0.1.42** | Stronger auto-port + stale registration invalidation; always-on callback server; `setCallbackPort` sync |
 | **2.0.0** | MCP `2026-07-28` stateless remote transport; stdio bridge (initialize shim, `_meta` strip, list-method shims); `--protocol` CLI; localhost OAuth skip; SDK 1.30 |
 | **2.0.1** | Connect-time recovery when Obot/gateway rejects cached OAuth (`401 after successful authentication`); opens browser instead of fatal exit |
+| **2.1.0** | OAuth coordination ([#17](https://github.com/abluva/mcp-remote/issues/17)): cross-process primary election, secondary token handoff, stale dynamic client registration recovery; SSE reconnect + header preservation; MCP method metadata / startup ordering fixes; OAuth discovery compression off; custom header redaction in logs |
 
 ---
 
@@ -150,6 +160,7 @@ This fork was developed and tested against the **Abluva MCP filter gateway** (`a
 - Hub logout / redeploy → **connect-time** re-auth when cached Obot token is rejected (`401 after successful authentication`, v2.0.1+)
 - Short-lived MCP access tokens + refresh
 - Multiple MCP servers in one Claude config (SQL Sandbox + Atlassian, etc.)
+- Claude Desktop spawning duplicate `mcp-remote` processes per server — cross-process OAuth coordination (v2.1.0+, [#17](https://github.com/abluva/mcp-remote/issues/17))
 
 ---
 

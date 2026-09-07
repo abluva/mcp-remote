@@ -95,6 +95,11 @@ Upstream `mcp-remote` is the de facto OAuth bridge for stdio-only MCP clients. S
 | **Port clash** with multiple MCP servers (no explicit port) | [#306](https://github.com/geelen/mcp-remote/issues/306), [#262](https://github.com/geelen/mcp-remote/pull/262) | 0.1.40, 0.1.42 |
 | Silent token expiry → browser re-auth loops | [#273](https://github.com/geelen/mcp-remote/issues/273) | 0.1.41 ([#290](https://github.com/geelen/mcp-remote/pull/290)) |
 | Token exchange to wrong URL (proxy mode) | [#270](https://github.com/geelen/mcp-remote/issues/270) | 0.1.41 ([#302](https://github.com/geelen/mcp-remote/pull/302)) |
+| **Concurrent OAuth** when Claude spawns duplicate processes | [#17](https://github.com/abluva/mcp-remote/issues/17), [#245](https://github.com/geelen/mcp-remote/issues/245) | 2.1.0 |
+| **Stale dynamic client registration** after port / callback changes | [#253](https://github.com/geelen/mcp-remote/issues/253) | 2.1.0 |
+| **SSE reconnect** drops session / headers after network blip | — | 2.1.0 |
+| **Tool call failures** after MCP 2.0 (method metadata / transforms lost) | — | 2.1.0 |
+| **Agent keys logged** in custom header debug output | — | 2.1.0 |
 
 See [ABLUVA-FORK.md](./ABLUVA-FORK.md) for the complete table and version notes.
 
@@ -113,7 +118,8 @@ geelen/mcp-remote @ v0.1.38 (main)
                 ├── v0.1.41  #297, #290, #302
                 ├── v0.1.42  Stale registration invalidation + port sync
                 ├── v2.0.0   MCP 2026-07-28 stateless transport
-                └── v2.0.1   Connect-time stale OAuth recovery
+                ├── v2.0.1   Connect-time stale OAuth recovery
+                └── v2.1.0   OAuth coordination (#17), SSE reconnect, MCP metadata fixes
 ```
 
 ---

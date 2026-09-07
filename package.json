@@ -1,6 +1,6 @@
 {
   "name": "@abluva/mcp-remote",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "MCP remote proxy with OAuth — Abluva fork with mid-session re-auth, reliable OAuth callback handling, and MCP 2026-07-28 stateless support",
   "keywords": [
     "mcp",
