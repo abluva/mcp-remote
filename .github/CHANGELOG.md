@@ -7,6 +7,32 @@ For full upstream issue/PR mapping and detailed rationale behind each fix, see [
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-07
+### Fixed
+- Cross-process OAuth coordination when Claude Desktop spawns duplicate `mcp-remote` processes ([#17](https://github.com/abluva/mcp-remote/issues/17)) — exclusive callback-port primary election; secondaries wait for primary tokens instead of racing `code_verifier` / callback writes
+- Secondary OAuth token handoff for non-primary processes
+- Stale dynamic OAuth client registration after port or callback URL changes — re-register only when this process owns coordination
+- OAuth discovery metadata fetch failures behind compressing proxies — disable `Accept-Encoding` on RFC 9728 metadata requests
+- Legacy SSE session loss after reconnect — `ReinitAwareSSETransport` re-runs `initialize`; SDK headers preserved across SSE reconnects
+- MCP method metadata and startup ordering lost through the HTTP transport proxy
+- Response transforms dropped during MCP startup sequencing
+- Custom header values (e.g. agent keys) appearing in debug logs — values now redacted
+
+### Added
+- No-auth fast path — skip eager OAuth coordination when remote is reachable without authentication
+- Regression tests for Issue #17 cross-process OAuth election
+
+## [2.0.1]
+### Fixed
+- Connect-time recovery when Obot/gateway rejects cached OAuth (`401 after successful authentication`) — invalidate tokens and open browser instead of fatal exit
+
+## [2.0.0]
+### Added
+- MCP `2026-07-28` stateless remote transport (`--protocol auto|legacy|2026-07-28`)
+- POST-only remote transport with stdio bridge shims (`initialize`, `_meta` strip, list-method shims)
+- Local dev OAuth skip for `http://127.0.0.1` / `localhost` MCP URLs
+- SDK bump to `@modelcontextprotocol/sdk` 1.30
+
 ## [0.1.42]
 ### Added
 - Stronger auto-port selection and stale registration invalidation
