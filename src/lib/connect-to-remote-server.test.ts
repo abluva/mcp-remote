@@ -4,6 +4,10 @@ const mockState = vi.hoisted(() => ({
   httpTransports: [] as Array<{ start: ReturnType<typeof vi.fn>; finishAuth: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }>,
   connectFailuresRemaining: 1,
   connectError: null as Error | null,
+  // Stateless (2026-07-28) transport mock state — its start() throws while failures remain.
+  statelessTransports: [] as Array<{ start: ReturnType<typeof vi.fn>; finishAuth: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }>,
+  statelessFailuresRemaining: 0,
+  statelessError: null as Error | null,
 }))
 
 vi.mock('@modelcontextprotocol/sdk/client/auth.js', () => ({
@@ -62,10 +66,32 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => {
   return { Client }
 })
 
-import { connectToRemoteServer, isStalePostAuth401Error } from './utils'
+vi.mock('./stateless-http-transport', () => {
+  class StatelessHTTPTransport {
+    start = vi.fn().mockImplementation(async () => {
+      if (mockState.statelessFailuresRemaining > 0) {
+        mockState.statelessFailuresRemaining--
+        throw mockState.statelessError ?? new Error('Unauthorized')
+      }
+    })
+    finishAuth = vi.fn().mockResolvedValue(undefined)
+    close = vi.fn().mockResolvedValue(undefined)
+    discoverResult = {}
+    constructor(
+      public url: URL,
+      public opts: unknown,
+    ) {
+      mockState.statelessTransports.push(this)
+    }
+  }
+  return { StatelessHTTPTransport }
+})
+
+import { connectToRemoteServer, isStalePostAuth401Error, REASON_AUTH_NEEDED, REASON_TOKEN_HANDOFF, PROTOCOL_2026_07_28 } from './utils'
 import { StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { auth as runMcpOAuthAuth } from '@modelcontextprotocol/sdk/client/auth.js'
 import { StaleClientRegistrationError } from './stale-client-registration-error'
+import { SecondaryHandoffExhaustedError } from './secondary-handoff-exhausted-error'
 
 describe('isStalePostAuth401Error', () => {
   it('matches StreamableHTTPError 401 after successful authentication', () => {
@@ -82,6 +108,9 @@ describe('connectToRemoteServer', () => {
     mockState.httpTransports.length = 0
     mockState.connectFailuresRemaining = 1
     mockState.connectError = null
+    mockState.statelessTransports.length = 0
+    mockState.statelessFailuresRemaining = 0
+    mockState.statelessError = null
     vi.mocked(runMcpOAuthAuth).mockResolvedValue('REDIRECT' as any)
     vi.spyOn(console, 'error').mockImplementation(() => {})
   })
@@ -354,9 +383,10 @@ describe('connectToRemoteServer', () => {
     for (const t of mockState.httpTransports) expect(t.finishAuth).not.toHaveBeenCalled()
   })
 
-  it('gives up after one reconnect when the sibling tokens still fail, without awaiting a code (regression: #322)', async () => {
-    // Server keeps rejecting even after reading the sibling's tokens: bounded to a single reconnect,
-    // then a clear error — never an unbounded wait on the secondary dummy waitForAuthCode.
+  it('gives up as a benign SecondaryHandoffExhaustedError after handoff + one coordinated recovery, without awaiting a code (regression: #322/#352)', async () => {
+    // Server keeps rejecting even after reading the sibling's tokens AND after one coordinated
+    // recovery: bounded, then a benign typed terminal (not the old generic fatal) — and never an
+    // unbounded wait on the secondary dummy waitForAuthCode.
     const waitForAuthCode = vi.fn().mockRejectedValue(new Error('waitForAuthCode must not be awaited for a secondary'))
     const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode, skipBrowserAuth: true, callbackPort: 0 })
     mockState.connectFailuresRemaining = Number.MAX_SAFE_INTEGER
@@ -364,8 +394,169 @@ describe('connectToRemoteServer', () => {
 
     await expect(
       connectToRemoteServer(null, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first', new Set(), 'legacy'),
-    ).rejects.toThrow(/Already attempted reconnection/)
+    ).rejects.toBeInstanceOf(SecondaryHandoffExhaustedError)
 
+    // Exactly one coordinated recovery attempt was made (authInitializer(true)); no code awaited.
+    expect(authInitializer.mock.calls.filter((c) => c[0] === true)).toHaveLength(1)
     expect(waitForAuthCode).not.toHaveBeenCalled()
+  })
+
+  // --- #352: secondary token-handoff retry budget separated from REASON_AUTH_NEEDED ---
+
+  it('handoff keeps its own allowance even when REASON_AUTH_NEEDED was already spent — legacy (#352)', async () => {
+    // A prior normal OAuth recovery already consumed REASON_AUTH_NEEDED. The token handoff must
+    // still get its own one reconnect (bounded by REASON_TOKEN_HANDOFF) rather than being starved.
+    const waitForAuthCode = vi.fn().mockRejectedValue(new Error('waitForAuthCode must not be awaited for a secondary'))
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode, skipBrowserAuth: true, callbackPort: 0 })
+    mockState.connectFailuresRemaining = 1 // one 401, then the handoff reconnect succeeds
+    mockState.connectError = new Error('Unauthorized')
+
+    const seeded = new Set<string>([REASON_AUTH_NEEDED])
+    const transport = await connectToRemoteServer(
+      null,
+      'https://mcp.example.com/mcp',
+      {} as any,
+      {},
+      authInitializer,
+      'http-first',
+      seeded,
+      'legacy',
+    )
+
+    expect(transport).toBeDefined()
+    expect(seeded.has(REASON_TOKEN_HANDOFF)).toBe(true)
+    expect(waitForAuthCode).not.toHaveBeenCalled()
+  })
+
+  it('is strictly bounded: initial 401 + handoff reconnect + one coordinated recovery, then exhausts — legacy (#352)', async () => {
+    const waitForAuthCode = vi.fn().mockRejectedValue(new Error('waitForAuthCode must not be awaited for a secondary'))
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode, skipBrowserAuth: true, callbackPort: 0 })
+
+    let connectCalls = 0
+    const client = {
+      connect: async () => {
+        connectCalls++
+        throw new Error('Unauthorized')
+      },
+    } as any
+
+    await expect(
+      connectToRemoteServer(client, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first', new Set(), 'legacy'),
+    ).rejects.toBeInstanceOf(SecondaryHandoffExhaustedError)
+
+    // initial attempt + Step A handoff reconnect + Step B coordinated-recovery reconnect = 3, then stop.
+    expect(connectCalls).toBe(3)
+    expect(authInitializer.mock.calls.filter((c) => c[0] === true)).toHaveLength(1)
+    expect(waitForAuthCode).not.toHaveBeenCalled()
+  })
+
+  it('takes over as primary when the coordinator re-elects it (primary vanished) — legacy (#352)', async () => {
+    // Step B's coordinated recovery returns skipBrowserAuth:false: the primary disappeared and this
+    // instance was elected primary. It must then run the normal browser-auth flow (awaiting a code)
+    // and reconnect — never a duplicate primary, guaranteed by the exclusive port bind (#17).
+    const waitForAuthCode = vi.fn().mockResolvedValue('takeover-code')
+    const authInitializer = vi.fn().mockImplementation(async (force?: boolean) => {
+      if (force) return { waitForAuthCode, skipBrowserAuth: false, callbackPort: 0 } // took over as primary
+      return { waitForAuthCode, skipBrowserAuth: true, callbackPort: 0 } // secondary
+    })
+
+    let connectCalls = 0
+    const client = {
+      connect: async () => {
+        connectCalls++
+        if (connectCalls < 3) throw new Error('Unauthorized')
+      },
+    } as any
+
+    const transport = await connectToRemoteServer(
+      client,
+      'https://mcp.example.com/mcp',
+      {} as any,
+      {},
+      authInitializer,
+      'http-first',
+      new Set(),
+      'legacy',
+    )
+
+    expect(transport).toBeDefined()
+    expect(connectCalls).toBe(3) // initial 401 + handoff reconnect 401 + post-takeover reconnect OK
+    expect(authInitializer.mock.calls.filter((c) => c[0] === true)).toHaveLength(1)
+    expect(waitForAuthCode).toHaveBeenCalledTimes(1) // ran its own auth exactly once after takeover
+  })
+
+  it('handoff keeps its own allowance even when REASON_AUTH_NEEDED was already spent — stateless (#352)', async () => {
+    const waitForAuthCode = vi.fn().mockRejectedValue(new Error('waitForAuthCode must not be awaited for a secondary'))
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode, skipBrowserAuth: true, callbackPort: 0 })
+    mockState.statelessFailuresRemaining = 1 // one 401, then the handoff reconnect succeeds
+    mockState.statelessError = new Error('Unauthorized')
+
+    const seeded = new Set<string>([REASON_AUTH_NEEDED])
+    const transport = await connectToRemoteServer(
+      null,
+      'https://mcp.example.com/mcp',
+      { tokens: async () => undefined } as any,
+      {},
+      authInitializer,
+      'http-first',
+      seeded,
+      PROTOCOL_2026_07_28,
+    )
+
+    expect(transport).toBeDefined()
+    expect(seeded.has(REASON_TOKEN_HANDOFF)).toBe(true)
+    expect(mockState.statelessTransports.length).toBe(2) // initial + one handoff reconnect
+    expect(waitForAuthCode).not.toHaveBeenCalled()
+  })
+
+  it('is strictly bounded and exhausts to SecondaryHandoffExhaustedError — stateless (#352)', async () => {
+    const waitForAuthCode = vi.fn().mockRejectedValue(new Error('waitForAuthCode must not be awaited for a secondary'))
+    const authInitializer = vi.fn().mockResolvedValue({ waitForAuthCode, skipBrowserAuth: true, callbackPort: 0 })
+    mockState.statelessFailuresRemaining = Number.MAX_SAFE_INTEGER
+    mockState.statelessError = new Error('Unauthorized')
+
+    await expect(
+      connectToRemoteServer(
+        null,
+        'https://mcp.example.com/mcp',
+        { tokens: async () => undefined } as any,
+        {},
+        authInitializer,
+        'http-first',
+        new Set(),
+        PROTOCOL_2026_07_28,
+      ),
+    ).rejects.toBeInstanceOf(SecondaryHandoffExhaustedError)
+
+    // initial + Step A reconnect + Step B recovery reconnect = 3 transports constructed, then stop.
+    expect(mockState.statelessTransports.length).toBe(3)
+    expect(authInitializer.mock.calls.filter((c) => c[0] === true)).toHaveLength(1)
+    expect(waitForAuthCode).not.toHaveBeenCalled()
+  })
+
+  it('takes over as primary when the coordinator re-elects it (primary vanished) — stateless (#352)', async () => {
+    const waitForAuthCode = vi.fn().mockResolvedValue('takeover-code')
+    const authInitializer = vi.fn().mockImplementation(async (force?: boolean) => {
+      if (force) return { waitForAuthCode, skipBrowserAuth: false, callbackPort: 0 }
+      return { waitForAuthCode, skipBrowserAuth: true, callbackPort: 0 }
+    })
+    mockState.statelessFailuresRemaining = 2 // initial 401 + handoff reconnect 401, then success
+    mockState.statelessError = new Error('Unauthorized')
+
+    const transport = await connectToRemoteServer(
+      null,
+      'https://mcp.example.com/mcp',
+      { tokens: async () => undefined } as any,
+      {},
+      authInitializer,
+      'http-first',
+      new Set(),
+      PROTOCOL_2026_07_28,
+    )
+
+    expect(transport).toBeDefined()
+    expect(mockState.statelessTransports.length).toBe(3)
+    expect(authInitializer.mock.calls.filter((c) => c[0] === true)).toHaveLength(1)
+    expect(waitForAuthCode).toHaveBeenCalledTimes(1)
   })
 })

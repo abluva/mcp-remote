@@ -31,6 +31,7 @@ import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './l
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import { createLazyAuthCoordinator, waitForPrimaryTokens } from './lib/coordination'
 import { StatelessHTTPTransport } from './lib/stateless-http-transport'
+import { SecondaryHandoffExhaustedError, isBenignSecondaryExit } from './lib/secondary-handoff-exhausted-error'
 
 /**
  * Main function to run the proxy
@@ -63,8 +64,14 @@ async function runProxy(
     waitForAuthCode: () => Promise<string>
     skipBrowserAuth: boolean
     callbackPort: number
+    coordinationPort?: number
   }
   let effectiveCallbackPort = callbackPort
+  // The port where the elected OAuth primary actually listens. Defaults to the canonical port, but
+  // if #17 coordination elected the primary on a deterministic fallback port (canonical occupied by
+  // an unrelated process), this is updated to that real port so the #352 live-primary check probes
+  // the correct server rather than the unrelated occupant.
+  let primaryCoordinationPort = callbackPort
   let server: Server | undefined
 
   if (skipOAuthSetup) {
@@ -119,6 +126,9 @@ async function runProxy(
       initialAuthState = await authCoordinator.initializeAuth()
 
       effectiveCallbackPort = initialAuthState.callbackPort
+      if (initialAuthState.coordinationPort !== undefined) {
+        primaryCoordinationPort = initialAuthState.coordinationPort
+      }
       server = initialAuthState.server
       if (!initialAuthState.skipBrowserAuth) {
         await waitForCallbackServer(effectiveCallbackPort)
@@ -165,6 +175,7 @@ async function runProxy(
 
     server = authState.server
     effectiveCallbackPort = authState.callbackPort
+    primaryCoordinationPort = authState.coordinationPort
     authProvider.setCallbackPort(effectiveCallbackPort)
 
     if (authState.skipBrowserAuth) {
@@ -232,6 +243,26 @@ async function runProxy(
     }
     setupSignalHandlers(cleanup)
   } catch (error) {
+    // A secondary instance that exhausted the bounded token handoff (#352) is a benign terminal
+    // *only* when the elected primary is still alive and serving this server: exit quietly (0) so
+    // the MCP host does not surface a false "Server disconnected" for a server the primary handles.
+    if (error instanceof SecondaryHandoffExhaustedError) {
+      // Probe the ACTUAL coordinating-primary port (which may be a deterministic fallback port when
+      // the canonical port is held by an unrelated process), not the canonical callbackPort — and
+      // never the unrelated occupant, since coordination only reports a secondary after confirming
+      // that port hosts our OAuth callback (#352/#17).
+      const primaryAlive = !skipOAuthSetup && (await isCallbackServerListening(primaryCoordinationPort))
+      if (isBenignSecondaryExit(error, { skipOAuthSetup, primaryAlive })) {
+        log('Another mcp-remote instance is already connected and serving this server; this secondary is exiting quietly')
+        debugLog('Secondary handoff exhausted with a live primary confirmed; exiting 0', { primaryCoordinationPort })
+        if (server) {
+          server.close()
+        }
+        process.exit(0)
+      }
+      // No live primary could be confirmed — fall through and treat this as a genuine failure.
+      debugLog('Secondary handoff exhausted but no live primary confirmed; treating as fatal', { primaryCoordinationPort })
+    }
     log('Fatal error:', error)
     if (error instanceof Error && error.message.includes('self-signed certificate in certificate chain')) {
       log(`You may be behind a VPN!
