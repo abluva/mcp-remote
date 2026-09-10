@@ -4,6 +4,7 @@ import {
   injectRequestMeta,
   PROTOCOL_2026_07_28,
   isNonFatalSseDisconnect,
+  sanitizeCallToolResultForStdioClient,
   stripStatelessWireMeta,
 } from './stateless-protocol'
 
@@ -61,5 +62,25 @@ describe('stateless-protocol', () => {
     })
     expect(stripped).toEqual({ tools: [{ name: 'run_sql' }] })
     expect('_meta' in stripped).toBe(false)
+  })
+
+  it('sanitizeCallToolResultForStdioClient drops array structuredContent for Claude compatibility', () => {
+    const sanitized = sanitizeCallToolResultForStdioClient({
+      isError: false,
+      content: [{ type: 'text', text: '[{"id":"site-1"}]' }],
+      structuredContent: [{ id: 'site-1' }],
+      _meta: { _abluva: { decision: 'allowed-post' } },
+    })
+    expect(sanitized.structuredContent).toBeUndefined()
+    expect(sanitized.content).toEqual([{ type: 'text', text: '[{"id":"site-1"}]' }])
+    expect(sanitized._meta).toBeUndefined()
+  })
+
+  it('sanitizeCallToolResultForStdioClient keeps object structuredContent', () => {
+    const sanitized = sanitizeCallToolResultForStdioClient({
+      content: [{ type: 'text', text: 'ok' }],
+      structuredContent: { id: 'site-1' },
+    })
+    expect(sanitized.structuredContent).toEqual({ id: 'site-1' })
   })
 })

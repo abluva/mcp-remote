@@ -35,6 +35,7 @@ import {
   isNonFatalSseDisconnect,
   PROTOCOL_2026_07_28,
   ProtocolMode,
+  sanitizeCallToolResultForStdioClient,
   stripStatelessWireMeta,
 } from './stateless-protocol.js'
 
@@ -47,6 +48,8 @@ declare global {
 export const REASON_AUTH_NEEDED = 'authentication-needed'
 export const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
 export const REASON_STALE_CLIENT_REGISTRATION = 'stale-client-registration'
+/** Server rejected a token immediately after finishAuth — one extra browser re-auth allowed. */
+export const REASON_STALE_POST_AUTH = 'stale-post-auth-at-connect'
 
 export type { ProtocolMode, DiscoverResult } from './stateless-protocol.js'
 export { PROTOCOL_2026_07_28 } from './stateless-protocol.js'
@@ -335,7 +338,9 @@ async function reconnectAfterStaleOAuthAtConnect(
     resetTransportAuthState(options.authChallengeTransport)
   }
 
-  if (options.recursionReasons.has(REASON_AUTH_NEEDED)) {
+  // REASON_AUTH_NEEDED is set after a successful finishAuth before reconnect verification.
+  // That is not a failed auth loop — use a separate guard for this recovery path.
+  if (options.recursionReasons.has(REASON_STALE_POST_AUTH)) {
     throw error instanceof Error ? error : new Error(String(error))
   }
 
@@ -364,8 +369,8 @@ async function reconnectAfterStaleOAuthAtConnect(
   }
   await finishTarget.finishAuth(code)
 
-  options.recursionReasons.add(REASON_AUTH_NEEDED)
-  log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`)
+  options.recursionReasons.add(REASON_STALE_POST_AUTH)
+  log(`Recursively reconnecting for reason: ${REASON_STALE_POST_AUTH}`)
   return options.reconnect()
 }
 
@@ -555,6 +560,15 @@ export function mcpProxy({
             ...(remoteProtocolMode === PROTOCOL_2026_07_28 ? stripStatelessWireMeta(res.result) : res.result),
             tools: tools.filter((tool: any) => shouldIncludeTool(ignoredTools, tool.name)),
           },
+        }
+      }
+
+      if (req.method === 'tools/call' && res.result && typeof res.result === 'object') {
+        return {
+          ...res,
+          result: sanitizeCallToolResultForStdioClient(res.result as Record<string, unknown>, {
+            stripWireMeta: remoteProtocolMode === PROTOCOL_2026_07_28,
+          }),
         }
       }
 
@@ -1607,9 +1621,10 @@ export async function connectToRemoteServer(
           throw new Error(errorMessage)
         }
 
-        // Track this reason for recursion
-        recursionReasons.add(REASON_AUTH_NEEDED)
-        log(`Recursively reconnecting for reason: ${REASON_AUTH_NEEDED}`)
+        // Verify the new token on a fresh connect. Do not set REASON_AUTH_NEEDED here —
+        // that flag blocked reconnectAfterStaleOAuthAtConnect when the server still
+        // returned 401 after a successful token exchange (Abluva gateway/Obot redeploy).
+        log(`Recursively reconnecting after successful authorization`)
         debugLog('Recursively reconnecting after auth', { recursionReasons: Array.from(recursionReasons) })
 
         // Recursively call connectToRemoteServer with the updated recursion tracking
