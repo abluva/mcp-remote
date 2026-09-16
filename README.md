@@ -224,6 +224,17 @@ All the most popular MCP clients (Claude Desktop, Cursor & Windsurf) use the fol
       ]
 ```
 
+* To change the path `@abluva/mcp-remote` uses for the OAuth callback (by default `/oauth/callback`), add the `--callback-path` flag. Both the advertised `redirect_uri` and the local listener use it, for authorization servers that only accept an exact pre-registered redirect URI. Cached client registrations are only invalidated when the port changes, so clear `~/.mcp-auth` after changing the path.
+
+```json
+      "args": [
+        "@abluva/mcp-remote",
+        "https://remote.mcp.server/sse",
+        "--callback-path",
+        "/callback"
+      ]
+```
+
 * To allow HTTP connections in trusted private networks, add the `--allow-http` flag. Note: This should only be used in secure private networks where traffic cannot be intercepted.
 
 ```json

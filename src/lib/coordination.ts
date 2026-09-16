@@ -214,6 +214,7 @@ export async function waitForPrimaryTokens(
  * @param serverUrlHash The hash of the server URL
  * @param callbackPort The port to use for the callback server
  * @param events The event emitter to use for signaling
+ * @param callbackPath The path the callback server listens on
  * @returns An AuthCoordinator object with an initializeAuth method
  */
 export function createLazyAuthCoordinator(
@@ -221,6 +222,7 @@ export function createLazyAuthCoordinator(
   callbackPort: number,
   events: EventEmitter,
   authTimeoutMs: number,
+  callbackPath = '/oauth/callback',
 ): AuthCoordinator {
   let authState: PrimaryHandlers | null = null
 
@@ -261,7 +263,7 @@ export function createLazyAuthCoordinator(
       log('Initializing auth coordination on-demand')
       debugLog('Initializing auth coordination on-demand', { serverUrlHash, callbackPort })
 
-      authState = await coordinateAuth(serverUrlHash, callbackPort, events, authTimeoutMs, options?.force === true)
+      authState = await coordinateAuth(serverUrlHash, callbackPort, events, authTimeoutMs, callbackPath, options?.force === true)
       debugLog('Auth coordination completed', { skipBrowserAuth: authState.skipBrowserAuth })
       return authState
     },
@@ -308,6 +310,7 @@ function makeSecondaryResult(): PrimaryHandlers {
  * @param serverUrlHash The hash of the server URL
  * @param callbackPort The deterministic port to use for the callback server
  * @param events The event emitter to use for signaling
+ * @param callbackPath The path the callback server listens on
  * @param forcePrimary Forced re-authentication (clears our stale lockfile, then re-elects)
  * @returns An object with the server, waitForAuthCode function, and a flag indicating if browser auth can be skipped
  */
@@ -316,6 +319,7 @@ export async function coordinateAuth(
   callbackPort: number,
   events: EventEmitter,
   authTimeoutMs: number,
+  callbackPath = '/oauth/callback',
   forcePrimary = false,
 ): Promise<PrimaryHandlers> {
   debugLog('Coordinating authentication', { serverUrlHash, callbackPort, forcePrimary })
@@ -342,7 +346,7 @@ export async function coordinateAuth(
     try {
       const { server, waitForAuthCode, port: actualPort } = await setupOAuthCallbackServerWithLongPoll({
         port,
-        path: '/oauth/callback',
+        path: callbackPath,
         events,
         authTimeoutMs,
         allowPortFallback: false, // never drift; we walk a deterministic sequence instead
