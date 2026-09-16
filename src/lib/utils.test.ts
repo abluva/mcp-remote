@@ -359,6 +359,57 @@ describe('Feature: Command Line Arguments Parsing', () => {
     expect(result.ignoredTools).toEqual(['tool1', 'tool2'])
   })
 
+  it('Scenario: Use default callback path when not specified', async () => {
+    // Given command line arguments without --callback-path flag
+    const args = ['https://example.com/sse']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the upstream default path should be used
+    expect(result.callbackPath).toBe('/oauth/callback')
+  })
+
+  it('Scenario: Parse custom callback path', async () => {
+    // Given command line arguments with a --callback-path an IdP enforces
+    const args = ['https://example.com/sse', '8401', '--callback-path', '/callback']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the path is used and the port is still read as positional
+    expect(result.callbackPath).toBe('/callback')
+    expect(result.callbackPort).toBe(8401)
+  })
+
+  it('Scenario: Add a leading slash to a callback path given without one', async () => {
+    // Given a --callback-path value missing its leading slash
+    const args = ['https://example.com/sse', '--callback-path', 'callback']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the path should be normalised
+    expect(result.callbackPath).toBe('/callback')
+  })
+
+  it('Scenario: Do not treat a callback path value as the callback port', async () => {
+    // Given a --callback-path value that could be mistaken for a positional arg
+    const args = ['https://example.com/sse', '--callback-path', '/callback']
+    const usage = 'test usage'
+
+    // When parsing the command line arguments
+    const result = await parseCommandLineArgs(args, usage)
+
+    // Then the port should still be auto-selected rather than parsed from the path
+    expect(result.serverUrl).toBe('https://example.com/sse')
+    expect(result.callbackPath).toBe('/callback')
+    expect(result.callbackPort).toBeGreaterThan(0)
+  })
+
   it('Scenario: Use default auth timeout when not specified', async () => {
     // Given command line arguments without --auth-timeout flag
     const args = ['https://example.com/sse']

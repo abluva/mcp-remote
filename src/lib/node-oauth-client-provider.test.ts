@@ -303,6 +303,36 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(clientMetadata.scope).toBe('openid email profile')
     })
   })
+
+  describe('redirect URL', () => {
+    it('should default to the upstream callback path', () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+
+      expect(provider.redirectUrl).toBe('http://localhost:8080/oauth/callback')
+    })
+
+    it('should use a custom callback path when the IdP enforces one', () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        callbackPort: 8401,
+        callbackPath: '/callback',
+      })
+
+      expect(provider.redirectUrl).toBe('http://localhost:8401/callback')
+      expect(provider.clientMetadata.redirect_uris).toEqual(['http://localhost:8401/callback'])
+    })
+
+    it('should keep the custom path when the callback port is updated', () => {
+      provider = new NodeOAuthClientProvider({
+        ...defaultOptions,
+        callbackPath: '/callback',
+      })
+
+      provider.setCallbackPort(8401)
+
+      expect(provider.redirectUrl).toBe('http://localhost:8401/callback')
+    })
+  })
 })
 
 describe('NodeOAuthClientProvider - stale dynamic client registration preflight (#299)', () => {

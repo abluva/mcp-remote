@@ -1934,6 +1934,7 @@ export function getPositionalArgs(args: string[]): string[] {
     '--protocol',
     '--transport',
     '--host',
+    '--callback-path',
     '--header',
     '--static-oauth-client-metadata',
     '--static-oauth-client-info',
@@ -2041,6 +2042,16 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
   if (hostIndex !== -1 && hostIndex < args.length - 1) {
     host = args[hostIndex + 1]
     log(`Using callback hostname: ${host}`)
+  }
+
+  // Parse callback path. Some authorization servers (e.g. Okta) only accept an
+  // exact pre-registered redirect URI, which may not use the default path.
+  let callbackPath = '/oauth/callback' // Default
+  const callbackPathIndex = args.indexOf('--callback-path')
+  if (callbackPathIndex !== -1 && callbackPathIndex < args.length - 1) {
+    const specifiedPath = args[callbackPathIndex + 1]
+    callbackPath = specifiedPath.startsWith('/') ? specifiedPath : `/${specifiedPath}`
+    log(`Using callback path: ${callbackPath}`)
   }
 
   let staticOAuthClientMetadata: StaticOAuthClientMetadata = null
@@ -2166,6 +2177,7 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     headers,
     transportStrategy,
     host,
+    callbackPath,
     debug,
     staticOAuthClientMetadata,
     staticOAuthClientInfo,

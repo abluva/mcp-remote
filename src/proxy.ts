@@ -41,6 +41,7 @@ async function runProxy(
   headers: Record<string, string>,
   transportStrategy: TransportStrategy = 'http-first',
   host: string,
+  callbackPath: string,
   staticOAuthClientMetadata: StaticOAuthClientMetadata,
   staticOAuthClientInfo: StaticOAuthClientInformationFull,
   authorizeResource: string,
@@ -55,7 +56,7 @@ async function runProxy(
   const skipOAuthSetup = isLocalHttpServer(serverUrl)
 
   // Create a lazy auth coordinator
-  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs)
+  const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs, callbackPath)
 
   let discoveryResult: Awaited<ReturnType<typeof discoverOAuthServerInfo>>
   let initialAuthState: {
@@ -134,6 +135,7 @@ async function runProxy(
     serverUrl: discoveryResult.authorizationServerUrl,
     callbackPort: effectiveCallbackPort,
     host,
+    callbackPath,
     clientName: 'MCP CLI Proxy',
     staticOAuthClientMetadata,
     staticOAuthClientInfo,
@@ -270,6 +272,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
       headers,
       transportStrategy,
       host,
+      callbackPath,
       debug,
       staticOAuthClientMetadata,
       staticOAuthClientInfo,
@@ -285,6 +288,7 @@ parseCommandLineArgs(process.argv.slice(2), 'Usage: npx tsx proxy.ts <https://se
         headers,
         transportStrategy,
         host,
+        callbackPath,
         staticOAuthClientMetadata,
         staticOAuthClientInfo,
         authorizeResource,
