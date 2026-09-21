@@ -102,6 +102,47 @@ export function stripStatelessWireMeta<T extends Record<string, unknown>>(result
   return rest as Omit<T, '_meta'>
 }
 
+/**
+ * Normalize tools/call results before forwarding to stdio clients (Claude Desktop).
+ *
+ * Some upstream servers (Atlassian MCP) return `structuredContent` as an array, but
+ * CallToolResultSchema requires an object — strict clients accept the JSON-RPC frame
+ * in logs yet drop the tool result from the conversation when validation fails.
+ */
+export function sanitizeCallToolResultForStdioClient<T extends Record<string, unknown>>(
+  result: T,
+  options?: { stripWireMeta?: boolean },
+): T {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    return result
+  }
+
+  let next: Record<string, unknown> = options?.stripWireMeta
+    ? { ...stripStatelessWireMeta(result) }
+    : { ...result }
+
+  if (Array.isArray(next.structuredContent)) {
+    const { structuredContent: _removed, ...rest } = next
+    next = rest
+  }
+
+  const meta = next._meta
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    const metaCopy = { ...(meta as Record<string, unknown>) }
+    if ('_abluva' in metaCopy) {
+      delete metaCopy._abluva
+      if (Object.keys(metaCopy).length === 0) {
+        const { _meta: _removed, ...rest } = next
+        next = rest
+      } else {
+        next = { ...next, _meta: metaCopy }
+      }
+    }
+  }
+
+  return next as T
+}
+
 export function isNonFatalSseDisconnect(error: Error, pendingRequestCount: number): boolean {
   const msg = error.message ?? ''
   return pendingRequestCount === 0 && msg.includes('SSE stream disconnected')
