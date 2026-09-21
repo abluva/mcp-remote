@@ -80,11 +80,12 @@ These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/i
 | **npm packaging** | Scoped package `@abluva/mcp-remote`, `prepack` build, public publishConfig | 0.1.39+ |
 | **Cross-process OAuth coordination (#17)** | Exactly one OAuth primary per `serverUrlHash`; secondaries wait for primary tokens instead of racing callback / `code_verifier` writes | 2.1.0+ |
 | **Secondary token handoff** | Non-primary processes poll primary lockfile and reuse issued tokens | 2.1.0+ |
-| **Stale dynamic client registration** | Detect invalid `client_id` at token exchange; re-register only when this process owns OAuth coordination | 2.1.0+ |
-| **OAuth discovery without compression** | Disable `Accept-Encoding` on RFC 9728 metadata fetches (some gateways break compressed discovery) | 2.1.0+ |
-| **SSE reconnect resilience** | `ReinitAwareSSETransport` re-runs `initialize` after reconnect; preserve SDK headers across SSE sessions | 2.1.0+ |
+| **Stale dynamic client registration** | Detect invalid `client_id` at token exchange; re-register only when this process owns OAuth coordination ([#299](https://github.com/geelen/mcp-remote/issues/299)) | 2.1.0+ |
+| **OAuth discovery without compression** | Disable `Accept-Encoding` on RFC 9728 metadata fetches (some gateways break compressed discovery) ([#276](https://github.com/geelen/mcp-remote/issues/276), [#278](https://github.com/geelen/mcp-remote/issues/278)) | 2.1.0+ |
+| **SSE reconnect resilience** | `ReinitAwareSSETransport` re-runs `initialize` after reconnect; preserve SDK headers across SSE sessions ([#269](https://github.com/geelen/mcp-remote/issues/269)) | 2.1.0+ |
 | **HTTP transport metadata** | Preserve MCP method metadata and startup ordering through the stdio ↔ HTTP proxy | 2.1.0+ |
-| **Header redaction in logs** | Custom header values (e.g. agent keys) redacted in debug output | 2.1.0+ |
+| **Client response dispatcher preserved** | `mcp-remote-client` attaches diagnostics instead of replacing the SDK dispatcher on `transport.onmessage`, so `tools/list` / `resources/list` no longer time out ([#324](https://github.com/geelen/mcp-remote/issues/324)) | 2.1.0+ |
+| **Header redaction in logs** | Custom header values (e.g. agent keys) redacted in debug output ([#268](https://github.com/geelen/mcp-remote/issues/268)) | 2.1.0+ |
 | **No-auth server fast path** | Skip eager OAuth coordination when remote is reachable without auth | 2.1.0+ |
 
 ---
@@ -161,6 +162,8 @@ This fork was developed and tested against the **Abluva MCP filter gateway** (`a
 - Short-lived MCP access tokens + refresh
 - Multiple MCP servers in one Claude config (SQL Sandbox + Atlassian, etc.)
 - Claude Desktop spawning duplicate `mcp-remote` processes per server — cross-process OAuth coordination (v2.1.0+, [#17](https://github.com/abluva/mcp-remote/issues/17))
+
+Beyond the gateway, `test/regression` runs the built proxy against local fixtures for repeatable regression coverage of [#268](https://github.com/geelen/mcp-remote/issues/268), [#269](https://github.com/geelen/mcp-remote/issues/269) and [#286](https://github.com/geelen/mcp-remote/issues/286) (`pnpm test:regression`).
 
 ---
 

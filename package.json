@@ -40,7 +40,8 @@
     "check": "prettier --check . && tsc",
     "lint-fix": "prettier --check . --write",
     "test:unit": "vitest run",
-    "test:unit:watch": "vitest"
+    "test:unit:watch": "vitest",
+    "test:regression": "pnpm --dir test/regression run test:regression"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
