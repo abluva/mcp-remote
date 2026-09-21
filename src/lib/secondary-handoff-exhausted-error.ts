@@ -32,10 +32,7 @@ export class SecondaryHandoffExhaustedError extends Error {
  * If any condition is false the caller must treat the failure as fatal, so a genuine problem is
  * never silently hidden.
  */
-export function isBenignSecondaryExit(
-  error: unknown,
-  context: { skipOAuthSetup: boolean; primaryAlive: boolean },
-): boolean {
+export function isBenignSecondaryExit(error: unknown, context: { skipOAuthSetup: boolean; primaryAlive: boolean }): boolean {
   if (!(error instanceof SecondaryHandoffExhaustedError)) return false
   if (context.skipOAuthSetup) return false
   return context.primaryAlive

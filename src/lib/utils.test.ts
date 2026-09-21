@@ -455,12 +455,7 @@ describe('Feature: Command Line Arguments Parsing', () => {
 
   it('Scenario: Parse --protocol before server URL (Claude Desktop flag order)', async () => {
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const args = [
-      '--protocol',
-      '2026-07-28',
-      '--allow-http',
-      'http://127.0.0.1:8095/mcp/v2',
-    ]
+    const args = ['--protocol', '2026-07-28', '--allow-http', 'http://127.0.0.1:8095/mcp/v2']
     const usage = 'test usage'
 
     const result = await parseCommandLineArgs(args, usage)
@@ -1014,9 +1009,7 @@ describe('Feature: MCP Proxy', () => {
     mockTransportToServer.onmessage!({ jsonrpc: '2.0', id: 4, result: { tools: { unexpected: true } } } as any)
 
     // Then the result is forwarded untouched rather than crashing the forward
-    expect(mockTransportToClient.send).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 4, result: { tools: { unexpected: true } } }),
-    )
+    expect(mockTransportToClient.send).toHaveBeenCalledWith(expect.objectContaining({ id: 4, result: { tools: { unexpected: true } } }))
   })
 
   it('Scenario: The initialized barrier releases queued requests after the 10s timeout (#310)', async () => {
@@ -1652,10 +1645,7 @@ describe('Feature: Legacy SSE session recovery (issue #269)', () => {
 
   it('Scenario: OAuth-only recovery (no SSE rotation) is unchanged', async () => {
     const client = makeClient()
-    const serverSend = vi
-      .fn()
-      .mockRejectedValueOnce(new UnauthorizedError())
-      .mockResolvedValue(undefined)
+    const serverSend = vi.fn().mockRejectedValueOnce(new UnauthorizedError()).mockResolvedValue(undefined)
     const server = {
       send: serverSend,
       close: vi.fn().mockResolvedValue(undefined),

@@ -29,6 +29,7 @@ import { EventEmitter } from 'events'
 import { version as MCP_REMOTE_VERSION } from '../../package.json'
 import { EnvHttpProxyAgent, fetch, Headers, RequestInit, setGlobalDispatcher } from 'undici'
 import { resolveProtocolMode } from './protocol-detector.js'
+import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js'
 import { StatelessHTTPTransport } from './stateless-http-transport.js'
 import {
   buildSyntheticInitializeResult,
@@ -305,7 +306,9 @@ function isRecoverableAuthError(error: Error): boolean {
 }
 
 function resetTransportAuthState(transport: Transport): void {
-  const t = transport as StreamableHTTPClientTransport & { _hasCompletedAuthFlow?: boolean }
+  // Not intersected with StreamableHTTPClientTransport: the SDK declares `_hasCompletedAuthFlow`
+  // private, and TS reduces such an intersection to `never`. The `in` guard below is the real check.
+  const t = transport as { _hasCompletedAuthFlow?: boolean }
   if (t && '_hasCompletedAuthFlow' in t) {
     t._hasCompletedAuthFlow = false
   }
@@ -313,11 +316,7 @@ function resetTransportAuthState(transport: Transport): void {
 
 /** SDK throws this when OAuth refresh succeeded but the server still returned 401 on retry. */
 export function isStalePostAuth401Error(error: unknown): boolean {
-  return (
-    error instanceof StreamableHTTPError &&
-    error.code === 401 &&
-    error.message.includes('401 after successful authentication')
-  )
+  return error instanceof StreamableHTTPError && error.code === 401 && error.message.includes('401 after successful authentication')
 }
 
 async function reconnectAfterStaleOAuthAtConnect(
@@ -334,8 +333,10 @@ async function reconnectAfterStaleOAuthAtConnect(
 ): Promise<Transport> {
   log('Rejected OAuth token at connect — clearing stale credentials and re-authenticating...')
   try {
-    if (typeof (options.authProvider as { invalidateCredentials?: (scope: string) => Promise<void> }).invalidateCredentials === 'function') {
-      await options.authProvider.invalidateCredentials('tokens')
+    if (
+      typeof (options.authProvider as { invalidateCredentials?: (scope: string) => Promise<void> }).invalidateCredentials === 'function'
+    ) {
+      await options.authProvider.invalidateCredentials?.('tokens')
     }
   } catch (invalidateError) {
     debugLog('Failed to invalidate cached OAuth tokens at connect', { invalidateError })
@@ -416,11 +417,10 @@ async function recoverFromStaleClientRegistration(
 
   if (!skipBrowserAuth) {
     if (
-      typeof (options.authProvider as { invalidateCredentials?: (scope: string) => Promise<void> })
-        .invalidateCredentials === 'function'
+      typeof (options.authProvider as { invalidateCredentials?: (scope: string) => Promise<void> }).invalidateCredentials === 'function'
     ) {
       log('Stale OAuth client registration — primary clearing credentials before fresh registration')
-      await options.authProvider.invalidateCredentials('all')
+      await options.authProvider.invalidateCredentials?.('all')
     } else {
       // Cannot clear the stale client registration — fail clearly and never reconnect with stale state.
       log('Stale OAuth client registration — provider cannot clear it; failing without reconnect')
@@ -847,7 +847,9 @@ export function mcpProxy({
     })
   }
 
-  transportToServer.onmessage = (_message) => {
+  // Annotated because `transportToServer` is a union whose `onmessage` signatures differ in arity,
+  // so TS cannot contextually type this parameter (it would be an implicit `any`).
+  transportToServer.onmessage = (_message: JSONRPCMessage) => {
     // Responses to our own internal re-initialize handshake are ours to consume, never the
     // client's (issue #269). They carry a sentinel id we minted in doReinitializeSession.
     const reinitId = (_message as Message)?.id
@@ -1031,9 +1033,7 @@ export function mcpProxy({
       log('onSendError: Error completing authorization:', authError)
       await replyAuthErrorToClient(
         failedMessage,
-        authError instanceof Error
-          ? authError.message
-          : 'MCP OAuth session expired — sign in again in your browser',
+        authError instanceof Error ? authError.message : 'MCP OAuth session expired — sign in again in your browser',
       )
       return
     }
@@ -1605,13 +1605,10 @@ export async function connectToRemoteServer(
         sseTransport ? 'http-only' : 'sse-only',
         recursionReasons,
       )
-    } else if (
-      error instanceof OAuthError &&
-      (error.message?.includes('refresh_token') || error.errorCode === 'invalid_request')
-    ) {
+    } else if (error instanceof OAuthError && (error.message?.includes('refresh_token') || error.errorCode === 'invalid_request')) {
       log('Stale OAuth refresh token — clearing cached tokens and reconnecting...')
       if (typeof (authProvider as { invalidateCredentials?: (scope: string) => Promise<void> }).invalidateCredentials === 'function') {
-        await authProvider.invalidateCredentials('tokens')
+        await authProvider.invalidateCredentials?.('tokens')
       }
       if (recursionReasons.has(REASON_AUTH_NEEDED)) {
         throw error
@@ -1846,13 +1843,13 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
     return new Promise((resolve) => {
       if (authCode) {
         resolve(authCode)
-        authCode = null 
+        authCode = null
         return
       }
 
       options.events.once('auth-code-received', (code) => {
         resolve(code)
-        authCode = null 
+        authCode = null
       })
     })
   }
@@ -1933,10 +1930,7 @@ async function resolveCallbackPort(serverUrlHash: string, specifiedPort?: number
 
   if (specifiedPort) {
     if (existingClientPort && specifiedPort !== existingClientPort) {
-      await invalidateOAuthClientRegistration(
-        serverUrlHash,
-        `callback port changed from ${existingClientPort} to ${specifiedPort}`,
-      )
+      await invalidateOAuthClientRegistration(serverUrlHash, `callback port changed from ${existingClientPort} to ${specifiedPort}`)
     }
     return specifiedPort
   }
@@ -1970,7 +1964,6 @@ async function bindExpressServer(
       }
 
       return { server, port }
-
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
         // When used as an election mutex the caller must observe EADDRINUSE (to become a

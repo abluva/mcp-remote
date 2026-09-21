@@ -7,9 +7,12 @@ import {
   sanitizeCallToolResultForStdioClient,
   stripStatelessWireMeta,
 } from './stateless-protocol'
+import type { JSONRPCRequest } from '@modelcontextprotocol/sdk/types.js'
 
 describe('stateless-protocol', () => {
   it('injectRequestMeta adds _meta to params', () => {
+    // injectRequestMeta returns the JSONRPCMessage union; narrow to the request member this test
+    // constructs, since the response members carry no `params`.
     const msg = injectRequestMeta(
       { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} },
       {
@@ -17,7 +20,7 @@ describe('stateless-protocol', () => {
         clientInfo: { name: 'test', version: '1.0.0' },
         clientCapabilities: { tools: {} },
       },
-    )
+    ) as JSONRPCRequest
     expect(msg.params?._meta?.['io.modelcontextprotocol/protocolVersion']).toBe(PROTOCOL_2026_07_28)
   })
 

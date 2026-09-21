@@ -51,6 +51,7 @@ npx changeset
 ```
 
 This will prompt you for:
+
 - **Bump type** — `patch` (bug fix), `minor` (new feature, backwards compatible), or `major` (breaking change)
 - **Summary** — a one-line description of the change, written as it should appear in `CHANGELOG.md`
 
@@ -75,6 +76,7 @@ Skip this step only for changes with no user-facing impact (e.g. internal docs, 
 ## Reporting bugs
 
 Please include:
+
 - `@abluva/mcp-remote` version
 - Node version
 - MCP client (Claude Desktop, Cursor, Windsurf, etc.) and version

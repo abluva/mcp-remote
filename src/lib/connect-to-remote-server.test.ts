@@ -5,7 +5,11 @@ const mockState = vi.hoisted(() => ({
   connectFailuresRemaining: 1,
   connectError: null as Error | null,
   // Stateless (2026-07-28) transport mock state — its start() throws while failures remain.
-  statelessTransports: [] as Array<{ start: ReturnType<typeof vi.fn>; finishAuth: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }>,
+  statelessTransports: [] as Array<{
+    start: ReturnType<typeof vi.fn>
+    finishAuth: ReturnType<typeof vi.fn>
+    close: ReturnType<typeof vi.fn>
+  }>,
   statelessFailuresRemaining: 0,
   statelessError: null as Error | null,
 }))
@@ -95,9 +99,7 @@ import { SecondaryHandoffExhaustedError } from './secondary-handoff-exhausted-er
 
 describe('isStalePostAuth401Error', () => {
   it('matches StreamableHTTPError 401 after successful authentication', () => {
-    expect(
-      isStalePostAuth401Error(new StreamableHTTPError(401, 'Server returned 401 after successful authentication')),
-    ).toBe(true)
+    expect(isStalePostAuth401Error(new StreamableHTTPError(401, 'Server returned 401 after successful authentication'))).toBe(true)
     expect(isStalePostAuth401Error(new StreamableHTTPError(401, 'Unauthorized'))).toBe(false)
     expect(isStalePostAuth401Error(new Error('Unauthorized'))).toBe(false)
   })
@@ -164,14 +166,7 @@ describe('connectToRemoteServer', () => {
       callbackPort: 0,
     })
 
-    await connectToRemoteServer(
-      null,
-      'https://agent.example.com/mcp-connect/ms1abc',
-      authProvider,
-      {},
-      authInitializer,
-      'http-first',
-    )
+    await connectToRemoteServer(null, 'https://agent.example.com/mcp-connect/ms1abc', authProvider, {}, authInitializer, 'http-first')
 
     expect(invalidateCredentials).toHaveBeenCalledWith('tokens')
     expect(authInitializer).toHaveBeenCalledWith(true)
@@ -196,16 +191,7 @@ describe('connectToRemoteServer', () => {
       },
     } as any
 
-    await connectToRemoteServer(
-      client,
-      'https://mcp.example.com/mcp',
-      authProvider,
-      {},
-      authInitializer,
-      'http-first',
-      new Set(),
-      'legacy',
-    )
+    await connectToRemoteServer(client, 'https://mcp.example.com/mcp', authProvider, {}, authInitializer, 'http-first', new Set(), 'legacy')
 
     expect(authInitializer).toHaveBeenCalledWith() // no force argument
     expect(invalidateCredentials).toHaveBeenCalledTimes(1)
@@ -229,16 +215,7 @@ describe('connectToRemoteServer', () => {
       },
     } as any
 
-    await connectToRemoteServer(
-      client,
-      'https://mcp.example.com/mcp',
-      authProvider,
-      {},
-      authInitializer,
-      'http-first',
-      new Set(),
-      'legacy',
-    )
+    await connectToRemoteServer(client, 'https://mcp.example.com/mcp', authProvider, {}, authInitializer, 'http-first', new Set(), 'legacy')
 
     expect(authInitializer).toHaveBeenCalledWith() // no force argument
     expect(invalidateCredentials).not.toHaveBeenCalled()
@@ -280,8 +257,7 @@ describe('connectToRemoteServer', () => {
     expect(primary.invalidateCredentials).toHaveBeenCalledWith('all')
     expect(secondary.invalidateCredentials).not.toHaveBeenCalled()
     // Exactly one of the two instances performed the destructive invalidation.
-    const totalInvalidations =
-      primary.invalidateCredentials.mock.calls.length + secondary.invalidateCredentials.mock.calls.length
+    const totalInvalidations = primary.invalidateCredentials.mock.calls.length + secondary.invalidateCredentials.mock.calls.length
     expect(totalInvalidations).toBe(1)
     // Both instances still recovered (reconnected once each).
     expect(primary.connectCalls).toBe(2)
@@ -305,16 +281,7 @@ describe('connectToRemoteServer', () => {
     } as any
 
     await expect(
-      connectToRemoteServer(
-        client,
-        'https://mcp.example.com/mcp',
-        authProvider,
-        {},
-        authInitializer,
-        'http-first',
-        new Set(),
-        'legacy',
-      ),
+      connectToRemoteServer(client, 'https://mcp.example.com/mcp', authProvider, {}, authInitializer, 'http-first', new Set(), 'legacy'),
     ).rejects.toBeInstanceOf(StaleClientRegistrationError)
 
     // Only the initial connect ran; recovery reconnect must NOT happen when the stale
@@ -340,16 +307,7 @@ describe('connectToRemoteServer', () => {
     } as any
 
     await expect(
-      connectToRemoteServer(
-        client,
-        'https://mcp.example.com/mcp',
-        authProvider,
-        {},
-        authInitializer,
-        'http-first',
-        new Set(),
-        'legacy',
-      ),
+      connectToRemoteServer(client, 'https://mcp.example.com/mcp', authProvider, {}, authInitializer, 'http-first', new Set(), 'legacy'),
     ).rejects.toBeInstanceOf(StaleClientRegistrationError)
 
     // Exactly one recovery attempt (invalidate + reconnect); the second stale rethrows before

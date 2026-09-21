@@ -242,11 +242,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     debugLog('Reading OAuth tokens')
     debugLog('Token request stack trace:', new Error().stack)
 
-    const tokens = await readJsonFile<OAuthTokensWithExpiresAt>(
-      this.serverUrlHash,
-      'tokens.json',
-      OAuthTokensWithExpiresAtSchema,
-    )
+    const tokens = await readJsonFile<OAuthTokensWithExpiresAt>(this.serverUrlHash, 'tokens.json', OAuthTokensWithExpiresAtSchema)
 
     if (tokens) {
       const timeLeft = tokens.expires_in || 0

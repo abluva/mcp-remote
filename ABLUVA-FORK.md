@@ -10,11 +10,11 @@ This document describes how **`@abluva/mcp-remote`** relates to upstream [`geele
 
 ## Lineage
 
-| Source | What we took |
-|--------|----------------|
-| **[geelen/mcp-remote](https://github.com/geelen/mcp-remote) `@main` (v0.1.38)** | Full codebase baseline — MCP SDK 1.25.3, HTTP-first transport, OAuth discovery (RFC 9728), lockfile coordination, etc. |
+| Source                                                                                                                                                                                        | What we took                                                                                                                                           |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **[geelen/mcp-remote](https://github.com/geelen/mcp-remote) `@main` (v0.1.38)**                                                                                                               | Full codebase baseline — MCP SDK 1.25.3, HTTP-first transport, OAuth discovery (RFC 9728), lockfile coordination, etc.                                 |
 | **[jacopoc/mcp-remote](https://github.com/jacopoc/mcp-remote) branch `implement-reauth-after-auth-error-on-send`** ([PR #213](https://github.com/geelen/mcp-remote/pull/213) — open upstream) | Mid-session re-authentication on auth errors during active MCP sessions (`onSendError`), `reset-auth-code` coordination, auth code reset after resolve |
-| **Abluva-specific fixes (v0.1.39–v0.1.42)** | OAuth callback reliability, auto port collision handling, proactive token refresh, JSON-RPC error propagation, proxy-mode `finishAuth` |
+| **Abluva-specific fixes (v0.1.39–v0.1.42)**                                                                                                                                                   | OAuth callback reliability, auto port collision handling, proactive token refresh, JSON-RPC error propagation, proxy-mode `finishAuth`                 |
 
 We did **not** fork from a random snapshot — the repo history starts at `geelen/mcp-remote@0.1.38` with Abluva commits on top.
 
@@ -24,83 +24,83 @@ We did **not** fork from a random snapshot — the repo history starts at `geele
 
 These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/issues) but are **fixed or mitigated** in `@abluva/mcp-remote`:
 
-| Issue | Summary | How we address it |
-|-------|---------|-------------------|
-| [#181](https://github.com/geelen/mcp-remote/issues/181) | Re-issuing OAuth tokens fails (refresh + new grant) | Mid-session `onSendError` → re-auth → `finishAuth` → retry |
-| [#286](https://github.com/geelen/mcp-remote/issues/286) | OAuth only on `initialize`; mid-session `tools/call` 401 fails silently | Same mid-session re-auth path; JSON-RPC errors returned to client |
-| [#248](https://github.com/geelen/mcp-remote/issues/248) | Runtime re-auth opens browser but callback server never starts | Eager callback server at startup; `waitForCallbackServer` before browser |
-| [#245](https://github.com/geelen/mcp-remote/issues/245) | Claude spawns duplicate processes; callback server dies | Dedicated callback server per proxy (`force: true` on startup); reuse listener on re-auth |
-| [#256](https://github.com/geelen/mcp-remote/issues/256) | Re-auth loop: code hits localhost but `POST /token` never called | Keep callback listener alive; correct `finishAuth` + `redirect_uri` sync |
-| [#91](https://github.com/geelen/mcp-remote/issues/91) | Revoked tokens → infinite auth loop / stuck unauthorized | Clear stale tokens; re-auth flow; connect-time recovery for rejected cached tokens (v2.0.1) |
-| [#293](https://github.com/geelen/mcp-remote/issues/293) | Server send errors swallowed — Claude hangs | Pending-request tracking + JSON-RPC error responses ([#297](https://github.com/geelen/mcp-remote/pull/297)) |
-| [#273](https://github.com/geelen/mcp-remote/issues/273) | No `expires_at` → silent expiry, broken re-auth | Persist `expires_at`; proactive refresh ~60s before expiry ([#290](https://github.com/geelen/mcp-remote/pull/290)) |
-| [#270](https://github.com/geelen/mcp-remote/issues/270) | Token exchange POSTed to resource URL instead of `token_endpoint` | `finishAuth` on transport that received 401 in proxy mode ([#302](https://github.com/geelen/mcp-remote/pull/302)) |
-| [#253](https://github.com/geelen/mcp-remote/issues/253) | Stale callback server → EADDRINUSE on reconnect | Bind retry + auto port selection + stale `client_info` invalidation ([#262](https://github.com/geelen/mcp-remote/pull/262) partial) |
-| [#306](https://github.com/geelen/mcp-remote/issues/306) | EADDRINUSE concurrent OAuth port collisions | Auto port resolution without explicit config (v0.1.40+); optional explicit port still supported |
-| [#301](https://github.com/geelen/mcp-remote/issues/301) | Authorize URL built from wrong origin | Authorization server metadata URL fix (from jacopoc branch) |
-| [abluva #17](https://github.com/abluva/mcp-remote/issues/17) | Concurrent OAuth when Claude spawns duplicate `mcp-remote` processes | Cross-process primary election via exclusive callback-port bind; secondary token handoff; gated stale-registration invalidation |
+| Issue                                                        | Summary                                                                 | How we address it                                                                                                                   |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| [#181](https://github.com/geelen/mcp-remote/issues/181)      | Re-issuing OAuth tokens fails (refresh + new grant)                     | Mid-session `onSendError` → re-auth → `finishAuth` → retry                                                                          |
+| [#286](https://github.com/geelen/mcp-remote/issues/286)      | OAuth only on `initialize`; mid-session `tools/call` 401 fails silently | Same mid-session re-auth path; JSON-RPC errors returned to client                                                                   |
+| [#248](https://github.com/geelen/mcp-remote/issues/248)      | Runtime re-auth opens browser but callback server never starts          | Eager callback server at startup; `waitForCallbackServer` before browser                                                            |
+| [#245](https://github.com/geelen/mcp-remote/issues/245)      | Claude spawns duplicate processes; callback server dies                 | Dedicated callback server per proxy (`force: true` on startup); reuse listener on re-auth                                           |
+| [#256](https://github.com/geelen/mcp-remote/issues/256)      | Re-auth loop: code hits localhost but `POST /token` never called        | Keep callback listener alive; correct `finishAuth` + `redirect_uri` sync                                                            |
+| [#91](https://github.com/geelen/mcp-remote/issues/91)        | Revoked tokens → infinite auth loop / stuck unauthorized                | Clear stale tokens; re-auth flow; connect-time recovery for rejected cached tokens (v2.0.1)                                         |
+| [#293](https://github.com/geelen/mcp-remote/issues/293)      | Server send errors swallowed — Claude hangs                             | Pending-request tracking + JSON-RPC error responses ([#297](https://github.com/geelen/mcp-remote/pull/297))                         |
+| [#273](https://github.com/geelen/mcp-remote/issues/273)      | No `expires_at` → silent expiry, broken re-auth                         | Persist `expires_at`; proactive refresh ~60s before expiry ([#290](https://github.com/geelen/mcp-remote/pull/290))                  |
+| [#270](https://github.com/geelen/mcp-remote/issues/270)      | Token exchange POSTed to resource URL instead of `token_endpoint`       | `finishAuth` on transport that received 401 in proxy mode ([#302](https://github.com/geelen/mcp-remote/pull/302))                   |
+| [#253](https://github.com/geelen/mcp-remote/issues/253)      | Stale callback server → EADDRINUSE on reconnect                         | Bind retry + auto port selection + stale `client_info` invalidation ([#262](https://github.com/geelen/mcp-remote/pull/262) partial) |
+| [#306](https://github.com/geelen/mcp-remote/issues/306)      | EADDRINUSE concurrent OAuth port collisions                             | Auto port resolution without explicit config (v0.1.40+); optional explicit port still supported                                     |
+| [#301](https://github.com/geelen/mcp-remote/issues/301)      | Authorize URL built from wrong origin                                   | Authorization server metadata URL fix (from jacopoc branch)                                                                         |
+| [abluva #17](https://github.com/abluva/mcp-remote/issues/17) | Concurrent OAuth when Claude spawns duplicate `mcp-remote` processes    | Cross-process primary election via exclusive callback-port bind; secondary token handoff; gated stale-registration invalidation     |
 
 ---
 
 ## Upstream open PRs incorporated (not yet merged on geelen)
 
-| PR | Title | Status in Abluva fork |
-|----|-------|------------------------|
+| PR                                                    | Title                                                  | Status in Abluva fork                               |
+| ----------------------------------------------------- | ------------------------------------------------------ | --------------------------------------------------- |
 | [#213](https://github.com/geelen/mcp-remote/pull/213) | Mid-session re-auth on `UnauthorizedError` during send | **Merged** (via jacopoc branch + Abluva extensions) |
-| [#297](https://github.com/geelen/mcp-remote/pull/297) | Propagate server send errors as JSON-RPC errors | **Merged** (v0.1.41) |
-| [#290](https://github.com/geelen/mcp-remote/pull/290) | Persist `expires_at` for proactive token refresh | **Merged** (v0.1.41) |
-| [#302](https://github.com/geelen/mcp-remote/pull/302) | `finishAuth` on correct transport in proxy mode | **Merged** (v0.1.41) |
-| [#262](https://github.com/geelen/mcp-remote/pull/262) | Recover from EADDRINUSE on callback port | **Largely merged** (v0.1.40 auto port + bind retry) |
-| [#260](https://github.com/geelen/mcp-remote/pull/260) | Bind callback listener before browser auth | **Largely merged** (eager startup + wait-for-port) |
+| [#297](https://github.com/geelen/mcp-remote/pull/297) | Propagate server send errors as JSON-RPC errors        | **Merged** (v0.1.41)                                |
+| [#290](https://github.com/geelen/mcp-remote/pull/290) | Persist `expires_at` for proactive token refresh       | **Merged** (v0.1.41)                                |
+| [#302](https://github.com/geelen/mcp-remote/pull/302) | `finishAuth` on correct transport in proxy mode        | **Merged** (v0.1.41)                                |
+| [#262](https://github.com/geelen/mcp-remote/pull/262) | Recover from EADDRINUSE on callback port               | **Largely merged** (v0.1.40 auto port + bind retry) |
+| [#260](https://github.com/geelen/mcp-remote/pull/260) | Bind callback listener before browser auth             | **Largely merged** (eager startup + wait-for-port)  |
 
 ---
 
 ## Upstream PRs **not** merged (yet)
 
-| PR | Title | Why skipped |
-|----|-------|-------------|
+| PR                                                    | Title                                                    | Why skipped                                                                                     |
+| ----------------------------------------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | [#272](https://github.com/geelen/mcp-remote/pull/272) | Respond to `initialize` immediately; OAuth in background | Large architectural change — avoids Claude’s ~60s initialize timeout but needs dedicated design |
-| Others | Transport, proxy, Windows edge cases | Tracked upstream; open PRs may supersede our patches |
+| Others                                                | Transport, proxy, Windows edge cases                     | Tracked upstream; open PRs may supersede our patches                                            |
 
 ---
 
 ## Abluva-original changes (not from a single upstream PR)
 
-| Area | Change | Versions |
-|------|--------|----------|
-| **Mid-session OAuth** | `onSendError` handles `UnauthorizedError`, stale refresh, `InvalidRequestError`; opens browser; retries failed JSON-RPC message | 0.1.39+ |
-| **Connect-time stale OAuth** | `401 after successful authentication` at connect → invalidate cached tokens, forced browser re-auth, one reconnect | 2.0.1+ |
-| **Eager callback server** | OAuth listener starts before remote connect and stays up for process lifetime | 0.1.39+ |
-| **Forced re-auth coordination** | Reuse live listener when possible; `forcePrimary` skips lockfile delegation; never close listener unnecessarily | 0.1.39+ |
-| **Auto callback ports** | Per-URL port hashing, bind retry on `EADDRINUSE`, invalidate stale `client_info` when port changes | 0.1.40+ |
-| **`authProvider` port sync** | `setCallbackPort()` keeps `redirect_uri` aligned with bound listener | 0.1.42+ |
-| **Dedicated startup server** | Always `initializeAuth({ force: true })` in proxy mode (Claude Desktop duplicate-process mitigation) | 0.1.42+ |
-| **MCP 2026-07-28 stateless** | `--protocol auto\|legacy\|2026-07-28`; POST-only remote transport; stdio bridge shims for Claude | 2.0.0+ |
-| **Local dev OAuth skip** | Skip OAuth callback server for `http://127.0.0.1` / `localhost` MCP URLs | 2.0.0+ |
-| **npm packaging** | Scoped package `@abluva/mcp-remote`, `prepack` build, public publishConfig | 0.1.39+ |
-| **Cross-process OAuth coordination (#17)** | Exactly one OAuth primary per `serverUrlHash`; secondaries wait for primary tokens instead of racing callback / `code_verifier` writes | 2.1.0+ |
-| **Secondary token handoff** | Non-primary processes poll primary lockfile and reuse issued tokens | 2.1.0+ |
-| **Stale dynamic client registration** | Detect invalid `client_id` at token exchange; re-register only when this process owns OAuth coordination ([#299](https://github.com/geelen/mcp-remote/issues/299)) | 2.1.0+ |
-| **OAuth discovery without compression** | Disable `Accept-Encoding` on RFC 9728 metadata fetches (some gateways break compressed discovery) ([#276](https://github.com/geelen/mcp-remote/issues/276), [#278](https://github.com/geelen/mcp-remote/issues/278)) | 2.1.0+ |
-| **SSE reconnect resilience** | `ReinitAwareSSETransport` re-runs `initialize` after reconnect; preserve SDK headers across SSE sessions ([#269](https://github.com/geelen/mcp-remote/issues/269)) | 2.1.0+ |
-| **HTTP transport metadata** | Preserve MCP method metadata and startup ordering through the stdio ↔ HTTP proxy | 2.1.0+ |
-| **Client response dispatcher preserved** | `mcp-remote-client` attaches diagnostics instead of replacing the SDK dispatcher on `transport.onmessage`, so `tools/list` / `resources/list` no longer time out ([#324](https://github.com/geelen/mcp-remote/issues/324)) | 2.1.0+ |
-| **Header redaction in logs** | Custom header values (e.g. agent keys) redacted in debug output ([#268](https://github.com/geelen/mcp-remote/issues/268)) | 2.1.0+ |
-| **No-auth server fast path** | Skip eager OAuth coordination when remote is reachable without auth | 2.1.0+ |
+| Area                                       | Change                                                                                                                                                                                                                     | Versions |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| **Mid-session OAuth**                      | `onSendError` handles `UnauthorizedError`, stale refresh, `InvalidRequestError`; opens browser; retries failed JSON-RPC message                                                                                            | 0.1.39+  |
+| **Connect-time stale OAuth**               | `401 after successful authentication` at connect → invalidate cached tokens, forced browser re-auth, one reconnect                                                                                                         | 2.0.1+   |
+| **Eager callback server**                  | OAuth listener starts before remote connect and stays up for process lifetime                                                                                                                                              | 0.1.39+  |
+| **Forced re-auth coordination**            | Reuse live listener when possible; `forcePrimary` skips lockfile delegation; never close listener unnecessarily                                                                                                            | 0.1.39+  |
+| **Auto callback ports**                    | Per-URL port hashing, bind retry on `EADDRINUSE`, invalidate stale `client_info` when port changes                                                                                                                         | 0.1.40+  |
+| **`authProvider` port sync**               | `setCallbackPort()` keeps `redirect_uri` aligned with bound listener                                                                                                                                                       | 0.1.42+  |
+| **Dedicated startup server**               | Always `initializeAuth({ force: true })` in proxy mode (Claude Desktop duplicate-process mitigation)                                                                                                                       | 0.1.42+  |
+| **MCP 2026-07-28 stateless**               | `--protocol auto\|legacy\|2026-07-28`; POST-only remote transport; stdio bridge shims for Claude                                                                                                                           | 2.0.0+   |
+| **Local dev OAuth skip**                   | Skip OAuth callback server for `http://127.0.0.1` / `localhost` MCP URLs                                                                                                                                                   | 2.0.0+   |
+| **npm packaging**                          | Scoped package `@abluva/mcp-remote`, `prepack` build, public publishConfig                                                                                                                                                 | 0.1.39+  |
+| **Cross-process OAuth coordination (#17)** | Exactly one OAuth primary per `serverUrlHash`; secondaries wait for primary tokens instead of racing callback / `code_verifier` writes                                                                                     | 2.1.0+   |
+| **Secondary token handoff**                | Non-primary processes poll primary lockfile and reuse issued tokens                                                                                                                                                        | 2.1.0+   |
+| **Stale dynamic client registration**      | Detect invalid `client_id` at token exchange; re-register only when this process owns OAuth coordination ([#299](https://github.com/geelen/mcp-remote/issues/299))                                                         | 2.1.0+   |
+| **OAuth discovery without compression**    | Disable `Accept-Encoding` on RFC 9728 metadata fetches (some gateways break compressed discovery) ([#276](https://github.com/geelen/mcp-remote/issues/276), [#278](https://github.com/geelen/mcp-remote/issues/278))       | 2.1.0+   |
+| **SSE reconnect resilience**               | `ReinitAwareSSETransport` re-runs `initialize` after reconnect; preserve SDK headers across SSE sessions ([#269](https://github.com/geelen/mcp-remote/issues/269))                                                         | 2.1.0+   |
+| **HTTP transport metadata**                | Preserve MCP method metadata and startup ordering through the stdio ↔ HTTP proxy                                                                                                                                          | 2.1.0+   |
+| **Client response dispatcher preserved**   | `mcp-remote-client` attaches diagnostics instead of replacing the SDK dispatcher on `transport.onmessage`, so `tools/list` / `resources/list` no longer time out ([#324](https://github.com/geelen/mcp-remote/issues/324)) | 2.1.0+   |
+| **Header redaction in logs**               | Custom header values (e.g. agent keys) redacted in debug output ([#268](https://github.com/geelen/mcp-remote/issues/268))                                                                                                  | 2.1.0+   |
+| **No-auth server fast path**               | Skip eager OAuth coordination when remote is reachable without auth                                                                                                                                                        | 2.1.0+   |
 
 ---
 
 ## Version history (Abluva releases)
 
-| Version | Highlights |
-|---------|------------|
-| **0.1.39** | Initial Abluva release: jacopoc #213 + callback/re-auth fixes; published as `@abluva/mcp-remote` |
-| **0.1.40** | Auto OAuth callback port selection; bind retry; reduce need for explicit ports in Claude config |
-| **0.1.41** | Upstream-aligned: #297, #290, #302; regression tests for proxy-mode `finishAuth` |
-| **0.1.42** | Stronger auto-port + stale registration invalidation; always-on callback server; `setCallbackPort` sync |
-| **2.0.0** | MCP `2026-07-28` stateless remote transport; stdio bridge (initialize shim, `_meta` strip, list-method shims); `--protocol` CLI; localhost OAuth skip; SDK 1.30 |
-| **2.0.1** | Connect-time recovery when Obot/gateway rejects cached OAuth (`401 after successful authentication`); opens browser instead of fatal exit |
-| **2.1.0** | OAuth coordination ([#17](https://github.com/abluva/mcp-remote/issues/17)): cross-process primary election, secondary token handoff, stale dynamic client registration recovery; SSE reconnect + header preservation; MCP method metadata / startup ordering fixes; OAuth discovery compression off; custom header redaction in logs |
+| Version    | Highlights                                                                                                                                                                                                                                                                                                                           |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **0.1.39** | Initial Abluva release: jacopoc #213 + callback/re-auth fixes; published as `@abluva/mcp-remote`                                                                                                                                                                                                                                     |
+| **0.1.40** | Auto OAuth callback port selection; bind retry; reduce need for explicit ports in Claude config                                                                                                                                                                                                                                      |
+| **0.1.41** | Upstream-aligned: #297, #290, #302; regression tests for proxy-mode `finishAuth`                                                                                                                                                                                                                                                     |
+| **0.1.42** | Stronger auto-port + stale registration invalidation; always-on callback server; `setCallbackPort` sync                                                                                                                                                                                                                              |
+| **2.0.0**  | MCP `2026-07-28` stateless remote transport; stdio bridge (initialize shim, `_meta` strip, list-method shims); `--protocol` CLI; localhost OAuth skip; SDK 1.30                                                                                                                                                                      |
+| **2.0.1**  | Connect-time recovery when Obot/gateway rejects cached OAuth (`401 after successful authentication`); opens browser instead of fatal exit                                                                                                                                                                                            |
+| **2.1.0**  | OAuth coordination ([#17](https://github.com/abluva/mcp-remote/issues/17)): cross-process primary election, secondary token handoff, stale dynamic client registration recovery; SSE reconnect + header preservation; MCP method metadata / startup ordering fixes; OAuth discovery compression off; custom header redaction in logs |
 
 ---
 
@@ -113,11 +113,7 @@ These are **open** on [geelen/mcp-remote](https://github.com/geelen/mcp-remote/i
   "mcpServers": {
     "My MCP Server": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@abluva/mcp-remote@latest",
-        "https://your-gateway.example/mcp-connect/<catalog-id>"
-      ]
+      "args": ["-y", "@abluva/mcp-remote@latest", "https://your-gateway.example/mcp-connect/<catalog-id>"]
     }
   }
 }

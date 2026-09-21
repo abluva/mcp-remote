@@ -210,11 +210,9 @@ async function runProxy(
       protocolMode,
     )
 
-    const remoteProtocolMode =
-      remoteTransport instanceof StatelessHTTPTransport ? PROTOCOL_2026_07_28 : 'legacy'
+    const remoteProtocolMode = remoteTransport instanceof StatelessHTTPTransport ? PROTOCOL_2026_07_28 : 'legacy'
 
-    const discoverResult =
-      remoteTransport instanceof StatelessHTTPTransport ? remoteTransport.discoverResult : undefined
+    const discoverResult = remoteTransport instanceof StatelessHTTPTransport ? remoteTransport.discoverResult : undefined
 
     mcpProxy({
       transportToClient: localTransport,

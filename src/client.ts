@@ -144,9 +144,7 @@ async function runClient(
           }
         }
         transport.onerror = reject
-        transport
-          .send({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
-          .catch(reject)
+        transport.send({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }).catch(reject)
       })
       log('Tools:', JSON.stringify(toolsResponse, null, 2))
       await transport.close()
