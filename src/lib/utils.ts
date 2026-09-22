@@ -56,6 +56,17 @@ export const REASON_STALE_CLIENT_REGISTRATION = 'stale-client-registration'
  * starves — a normal OAuth recovery or stale-token retry that may already have spent that budget.
  */
 export const REASON_TOKEN_HANDOFF = 'token-handoff'
+/**
+ * One-shot allowance for the browser-auth verification reconnect taken by an instance that already
+ * spent its token handoff (#352).
+ *
+ * Needed because two individually safe changes met in a merge: the handoff stopped spending
+ * REASON_AUTH_NEEDED (#352), and the REASON_AUTH_NEEDED write at the legacy post-finishAuth
+ * reconnect was removed so it could not block reconnectAfterStaleOAuthAtConnect. Together they left
+ * that reconnect with no bound, so a server answering every request with 401 kept reopening the
+ * browser. Kept distinct from REASON_AUTH_NEEDED so the stale-post-auth recovery is unaffected.
+ */
+export const REASON_POST_HANDOFF_AUTH = 'post-handoff-browser-auth'
 /** Server rejected a token immediately after finishAuth — one extra browser re-auth allowed. */
 export const REASON_STALE_POST_AUTH = 'stale-post-auth-at-connect'
 
@@ -1709,6 +1720,24 @@ export async function connectToRemoteServer(
             recursionReasons: Array.from(recursionReasons),
           })
           throw new Error(errorMessage)
+        }
+
+        // An instance that already spent its token handoff (#352) gets exactly one browser-auth
+        // verification reconnect. Without this the handoff route has no bound at all: the handoff no
+        // longer spends REASON_AUTH_NEEDED, and the REASON_AUTH_NEEDED write that used to sit here
+        // was removed so it could not block reconnectAfterStaleOAuthAtConnect — so a server that
+        // keeps returning 401 reopened the browser indefinitely. Scoped to the handoff route on
+        // purpose: a plain primary never sets REASON_TOKEN_HANDOFF and is left exactly as before.
+        if (recursionReasons.has(REASON_TOKEN_HANDOFF)) {
+          if (recursionReasons.has(REASON_POST_HANDOFF_AUTH)) {
+            const errorMessage = `Already attempted reconnection for reason: ${REASON_POST_HANDOFF_AUTH}. Giving up.`
+            log(errorMessage)
+            debugLog('Post-handoff browser auth already attempted, giving up', {
+              recursionReasons: Array.from(recursionReasons),
+            })
+            throw new Error(errorMessage)
+          }
+          recursionReasons.add(REASON_POST_HANDOFF_AUTH)
         }
 
         // Verify the new token on a fresh connect. Do not set REASON_AUTH_NEEDED here —

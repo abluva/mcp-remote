@@ -91,7 +91,14 @@ vi.mock('./stateless-http-transport', () => {
   return { StatelessHTTPTransport }
 })
 
-import { connectToRemoteServer, isStalePostAuth401Error, REASON_AUTH_NEEDED, REASON_TOKEN_HANDOFF, PROTOCOL_2026_07_28 } from './utils'
+import {
+  connectToRemoteServer,
+  isStalePostAuth401Error,
+  REASON_AUTH_NEEDED,
+  REASON_POST_HANDOFF_AUTH,
+  REASON_TOKEN_HANDOFF,
+  PROTOCOL_2026_07_28,
+} from './utils'
 import { StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { auth as runMcpOAuthAuth } from '@modelcontextprotocol/sdk/client/auth.js'
 import { StaleClientRegistrationError } from './stale-client-registration-error'
@@ -441,6 +448,36 @@ describe('connectToRemoteServer', () => {
     expect(connectCalls).toBe(3) // initial 401 + handoff reconnect 401 + post-takeover reconnect OK
     expect(authInitializer.mock.calls.filter((c) => c[0] === true)).toHaveLength(1)
     expect(waitForAuthCode).toHaveBeenCalledTimes(1) // ran its own auth exactly once after takeover
+  })
+
+  it('stops instead of looping when the server keeps returning 401 after a post-handoff browser auth — legacy (#352)', async () => {
+    // Regression guard for the merge of #352 (handoff no longer spends REASON_AUTH_NEEDED) with the
+    // removal of the REASON_AUTH_NEEDED write at the legacy post-finishAuth reconnect: together they
+    // left this route unbounded, so a server answering every request with 401 reopened the browser
+    // forever. The run must terminate with an explicit error after one post-handoff browser auth.
+    let connectCalls = 0
+    const waitForAuthCode = vi.fn().mockResolvedValue('code')
+    const authInitializer = vi.fn().mockImplementation(async () => ({
+      waitForAuthCode,
+      // Secondary for the first pass (runs the handoff), then this instance owns the callback.
+      skipBrowserAuth: connectCalls < 2,
+      callbackPort: 0,
+    }))
+    const client = {
+      connect: async () => {
+        connectCalls++
+        // Safety net: fails loudly as a loop rather than hanging the suite if the bound regresses.
+        if (connectCalls > 10) throw new Error('LOOPED: post-handoff browser auth is unbounded')
+        throw new Error('Unauthorized') // the server never accepts the token
+      },
+    } as any
+
+    await expect(
+      connectToRemoteServer(client, 'https://mcp.example.com/mcp', {} as any, {}, authInitializer, 'http-first', new Set(), 'legacy'),
+    ).rejects.toThrow(`Already attempted reconnection for reason: ${REASON_POST_HANDOFF_AUTH}. Giving up.`)
+
+    expect(connectCalls).toBe(3) // initial 401 + handoff reconnect 401 + one post-handoff verification 401
+    expect(waitForAuthCode).toHaveBeenCalledTimes(2) // exactly one extra browser auth, then it gives up
   })
 
   it('handoff keeps its own allowance even when REASON_AUTH_NEEDED was already spent — stateless (#352)', async () => {
