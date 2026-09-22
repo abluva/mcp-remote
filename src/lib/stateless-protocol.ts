@@ -53,9 +53,7 @@ export function injectRequestMeta(message: JSONRPCMessage, ctx: ClientMetaContex
       : {}
 
   const existingMeta =
-    params._meta && typeof params._meta === 'object' && !Array.isArray(params._meta)
-      ? (params._meta as Record<string, unknown>)
-      : {}
+    params._meta && typeof params._meta === 'object' && !Array.isArray(params._meta) ? (params._meta as Record<string, unknown>) : {}
 
   params._meta = { ...existingMeta, ...meta }
 
@@ -83,9 +81,7 @@ export function buildSyntheticInitializeResult(
 
   const supported = discover.supportedProtocolVersions ?? [PROTOCOL_2026_07_28]
   const protocolVersion =
-    requestedVersion && supported.includes(requestedVersion)
-      ? requestedVersion
-      : discover.protocolVersion ?? PROTOCOL_2026_07_28
+    requestedVersion && supported.includes(requestedVersion) ? requestedVersion : (discover.protocolVersion ?? PROTOCOL_2026_07_28)
 
   return {
     protocolVersion,
@@ -117,9 +113,7 @@ export function sanitizeCallToolResultForStdioClient<T extends Record<string, un
     return result
   }
 
-  let next: Record<string, unknown> = options?.stripWireMeta
-    ? { ...stripStatelessWireMeta(result) }
-    : { ...result }
+  let next: Record<string, unknown> = options?.stripWireMeta ? { ...stripStatelessWireMeta(result) } : { ...result }
 
   if (Array.isArray(next.structuredContent)) {
     const { structuredContent: _removed, ...rest } = next

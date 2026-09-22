@@ -6,7 +6,7 @@ import path from 'path'
 import fs from 'fs'
 import type { Server } from 'http'
 import { coordinateAuth, waitForPrimaryTokens } from './coordination'
-import { calculateFallbackPort, findAvailablePort, getServerUrlHash } from './utils'
+import { calculateFallbackPort, findAvailablePort, getServerUrlHash, isCallbackServerListening } from './utils'
 import { NodeOAuthClientProvider } from './node-oauth-client-provider'
 
 /**
@@ -294,6 +294,50 @@ describe('coordinateAuth — cross-process OAuth election (Issue #17)', () => {
     // promise that never settles (which previously blocked until the MCP host timed out). (#322)
     await expect(secondary.waitForAuthCode()).rejects.toThrow(/secondary instance/i)
   }, 15000)
+
+  it('secondary reports the real coordinating (fallback) port, not the canonical or its dummy port (#352 benign-exit)', async () => {
+    // The canonical port is squatted by an UNRELATED process, so #17 elects the primary on a
+    // deterministic fallback port. The secondary must surface that fallback port as its
+    // coordinationPort so the #352 benign-exit check can confirm the live primary on the correct
+    // port — never the canonical port (where the unrelated occupant lives) or its own dummy port.
+    const hash = getServerUrlHash('https://coord-port.example.com/mcp')
+    const canonicalPort = await findAvailablePort()
+
+    const blocker = net.createServer((socket) => blockerSockets.push(socket))
+    blockers.push(blocker)
+    await new Promise<void>((resolve) => blocker.listen(canonicalPort, '127.0.0.1', () => resolve()))
+
+    const p1 = coordinateAuth(hash, canonicalPort, new EventEmitter(), 5000)
+    const p2 = coordinateAuth(hash, canonicalPort, new EventEmitter(), 5000)
+
+    // Primary lands on the deterministic fallback port; complete its callback so the secondary unblocks.
+    const first = await Promise.race([p1, p2])
+    expect(first.skipBrowserAuth).toBe(false)
+    await fetch(`http://127.0.0.1:${first.callbackPort}/oauth/callback?code=test-code`).catch(() => {})
+
+    const [r1, r2] = await Promise.all([p1, p2])
+    track(r1.server)
+    track(r2.server)
+
+    const primary = [r1, r2].find((r) => !r.skipBrowserAuth)!
+    const secondary = [r1, r2].find((r) => r.skipBrowserAuth)!
+    const fallbackPort = calculateFallbackPort(hash, 1)
+
+    // Primary is on the fallback port, and reports it as its coordination port.
+    expect(primary.callbackPort).toBe(fallbackPort)
+    expect(primary.coordinationPort).toBe(fallbackPort)
+
+    // The secondary's coordinationPort points at the primary's real (fallback) port...
+    expect(secondary.coordinationPort).toBe(fallbackPort)
+    // ...which is neither the canonical port (unrelated occupant) nor its own throwaway dummy port.
+    expect(secondary.coordinationPort).not.toBe(canonicalPort)
+    expect(secondary.coordinationPort).not.toBe(secondary.callbackPort)
+
+    // Sanity: probing the coordinationPort confirms OUR primary; probing the canonical port (the
+    // unrelated raw-TCP occupant) does not — so the benign-exit check keys off the right port.
+    expect(await isCallbackServerListening(secondary.coordinationPort)).toBe(true)
+    expect(await isCallbackServerListening(canonicalPort)).toBe(false)
+  }, 25000)
 })
 
 /**

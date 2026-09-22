@@ -56,17 +56,18 @@ When an incident does occur, it is important to report it promptly.
 **To report a possible violation:**
 
 **Please do not open a public GitHub issue for security vulnerabilities.**  
-Security flaws in MCP filters or providers handling data-guard logic can have 
+Security flaws in MCP filters or providers handling data-guard logic can have
 serious downstream impact on applications and integrations that depend on them.
 
 ### GitHub Private Vulnerability Reporting (Preferred)
 
 Use GitHub's built-in private reporting:
+
 1. Go to the **Security** tab of this repository
 2. Click **"Report a vulnerability"**
 3. Fill in the details and submit
 
-This is the preferred method as it keeps the disclosure private and allows 
+This is the preferred method as it keeps the disclosure private and allows
 collaborative resolution directly on GitHub.
 
 Community Moderators take reports seriously and will respond in a timely manner. They will investigate all reports by reviewing messages, logs, recordings, or interviewing witnesses and participants.
@@ -85,9 +86,9 @@ If a violation is confirmed, the following enforcement ladder may be used. Sever
 2. **Consequence**: Private written warning
 3. **Repair**:
 
-  * Private apology
-  * Acknowledgment of responsibility
-  * Clarifying expectations
+- Private apology
+- Acknowledgment of responsibility
+- Clarifying expectations
 
 ---
 
@@ -97,9 +98,9 @@ If a violation is confirmed, the following enforcement ladder may be used. Sever
 2. **Consequence**: Warning + temporary cooldown period
 3. **Repair**:
 
-  * Apology
-  * Reflection during cooldown
-  * Careful re-entry into community
+- Apology
+- Reflection during cooldown
+- Careful re-entry into community
 
 ---
 
@@ -109,9 +110,9 @@ If a violation is confirmed, the following enforcement ladder may be used. Sever
 2. **Consequence**: Suspension with return conditions
 3. **Repair**:
 
-  * Respect suspension terms
-  * Meet return conditions
-  * Thoughtful reintegration
+- Respect suspension terms
+- Meet return conditions
+- Thoughtful reintegration
 
 ---
 
@@ -131,14 +132,14 @@ This ladder is a guideline and does not limit moderator discretion.
 
 This Code of Conduct applies:
 
-* Within all community spaces
-* When representing the community publicly
+- Within all community spaces
+- When representing the community publicly
 
 Examples include:
 
-* Using official email addresses
-* Posting via official social media
-* Acting as a representative at events
+- Using official email addresses
+- Posting via official social media
+- Acting as a representative at events
 
 ---
 
@@ -151,6 +152,5 @@ Contributor Covenant is stewarded by the Organization for Ethical Source and lic
 https://creativecommons.org/licenses/by-sa/4.0/
 
 For answers to common questions about Contributor Covenant, see the FAQ at https://www.contributor-covenant.org/faq. Translations are provided at https://www.contributor-covenant.org/translations. Additional enforcement and community guideline resources can be found at https://www.contributor-covenant.org/resources. The enforcement ladder was inspired by the work of Mozilla’s code of conduct team.
-
 
 The enforcement ladder was inspired by Mozilla’s Code of Conduct team.

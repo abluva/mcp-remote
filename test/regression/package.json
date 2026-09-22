@@ -1,0 +1,19 @@
+{
+  "name": "mcp-remote-regression",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:parent": "cd ../.. && pnpm build",
+    "test:regression": "pnpm build:parent && node run-all.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "express": "^5.2.1",
+    "zod": "^4.6.1"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/inspector": "2.6.0"
+  },
+  "packageManager": "pnpm@10.11.0"
+}

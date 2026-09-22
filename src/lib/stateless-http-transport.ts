@@ -7,12 +7,10 @@ import { auth as runMcpOAuthAuth, OAuthClientProvider, UnauthorizedError } from 
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js'
 import { fetch, RequestInit } from 'undici'
-import {
-  ClientMetaContext,
-  DiscoverResult,
-  injectRequestMeta,
-  PROTOCOL_2026_07_28,
-} from './stateless-protocol.js'
+// Type-only: the global `Headers` (undici's implementation at runtime in Node) has no `entries()`
+// under `lib: ["ES2022", "DOM"]`, which omits DOM.Iterable. Used purely to type the narrowed value.
+import type { Headers as UndiciHeaders } from 'undici'
+import { ClientMetaContext, DiscoverResult, injectRequestMeta, PROTOCOL_2026_07_28 } from './stateless-protocol.js'
 
 export type StatelessHTTPTransportOptions = {
   authProvider?: OAuthClientProvider
@@ -37,7 +35,7 @@ export class StatelessHTTPTransport implements Transport {
   private _metaContext: ClientMetaContext
   private _discoverResult?: DiscoverResult
   private _closed = false
-  private _resourceMetadataUrl?: string
+  private _resourceMetadataUrl?: URL
   private _scope?: string
 
   constructor(url: URL, opts: StatelessHTTPTransportOptions = {}) {
@@ -76,7 +74,9 @@ export class StatelessHTTPTransport implements Transport {
       authorizationCode,
       resourceMetadataUrl: this._resourceMetadataUrl,
       scope: this._scope,
-      fetchFn: (url, init) => this._fetchWithInit(url, init),
+      // The SDK's FetchLike is declared against the global RequestInit; this transport fetches
+      // through undici, whose RequestInit is a distinct (structurally near-identical) type.
+      fetchFn: (url, init) => this._fetchWithInit(url, init as RequestInit),
     })
     if (result !== 'AUTHORIZED') {
       throw new UnauthorizedError('Failed to authorize')
@@ -168,13 +168,18 @@ export class StatelessHTTPTransport implements Transport {
   }
 
   private _fetchWithInit = async (url: string | URL, init?: RequestInit): Promise<Response> => {
+    // `instanceof Headers` tests the *global* class, so the operands must be typed to include it:
+    // undici's HeadersInit names undici's own Headers, and narrowing by a foreign class leaves
+    // `.entries` unusable. Type-only widening — the runtime check and both branches are unchanged.
+    const baseHeaders: RequestInit['headers'] | globalThis.Headers = this._requestInit?.headers
+    const initHeaders: RequestInit['headers'] | globalThis.Headers = init?.headers
     const mergedHeaders = {
-      ...(this._requestInit?.headers instanceof Headers
-        ? Object.fromEntries(this._requestInit.headers.entries())
-        : ((this._requestInit?.headers as Record<string, string>) ?? {})),
-      ...(init?.headers instanceof Headers
-        ? Object.fromEntries(init.headers.entries())
-        : ((init?.headers as Record<string, string>) ?? {})),
+      ...(baseHeaders instanceof Headers
+        ? Object.fromEntries((baseHeaders as UndiciHeaders).entries())
+        : ((baseHeaders as Record<string, string>) ?? {})),
+      ...(initHeaders instanceof Headers
+        ? Object.fromEntries((initHeaders as UndiciHeaders).entries())
+        : ((initHeaders as Record<string, string>) ?? {})),
     }
 
     return fetch(url, {
@@ -193,12 +198,7 @@ export class StatelessHTTPTransport implements Transport {
 
     if ('method' in message && message.method) {
       headers['Mcp-Method'] = message.method
-      if (
-        message.method === 'tools/call' &&
-        message.params &&
-        typeof message.params === 'object' &&
-        !Array.isArray(message.params)
-      ) {
+      if (message.method === 'tools/call' && message.params && typeof message.params === 'object' && !Array.isArray(message.params)) {
         const name = (message.params as { name?: string }).name
         if (name) {
           headers['Mcp-Name'] = name

@@ -5,9 +5,11 @@
 Please **do not open a public GitHub issue** for security vulnerabilities.
 
 Instead, report vulnerabilities via:
+
 - GitHub's [private vulnerability reporting](https://github.com/abluva/mcp-remote/security/advisories/new) (preferred)
 
 Please include:
+
 - A description of the vulnerability and its impact
 - Steps to reproduce
 - Affected version(s)

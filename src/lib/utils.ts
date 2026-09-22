@@ -17,6 +17,7 @@ import {
 } from './protected-resource-metadata'
 import { fetchAuthorizationServerMetadata, type AuthorizationServerMetadata } from './authorization-server-metadata'
 import { StaleClientRegistrationError } from './stale-client-registration-error'
+import { SecondaryHandoffExhaustedError } from './secondary-handoff-exhausted-error'
 import express from 'express'
 import { Server } from 'http'
 import net from 'net'
@@ -28,6 +29,7 @@ import { EventEmitter } from 'events'
 import { version as MCP_REMOTE_VERSION } from '../../package.json'
 import { EnvHttpProxyAgent, fetch, Headers, RequestInit, setGlobalDispatcher } from 'undici'
 import { resolveProtocolMode } from './protocol-detector.js'
+import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js'
 import { StatelessHTTPTransport } from './stateless-http-transport.js'
 import {
   buildSyntheticInitializeResult,
@@ -48,6 +50,23 @@ declare global {
 export const REASON_AUTH_NEEDED = 'authentication-needed'
 export const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
 export const REASON_STALE_CLIENT_REGISTRATION = 'stale-client-registration'
+/**
+ * A SECONDARY instance's one-shot allowance for reconnecting with the primary's handed-over tokens
+ * (#352). Kept distinct from REASON_AUTH_NEEDED so a token handoff is never starved by — and never
+ * starves — a normal OAuth recovery or stale-token retry that may already have spent that budget.
+ */
+export const REASON_TOKEN_HANDOFF = 'token-handoff'
+/**
+ * One-shot allowance for the browser-auth verification reconnect taken by an instance that already
+ * spent its token handoff (#352).
+ *
+ * Needed because two individually safe changes met in a merge: the handoff stopped spending
+ * REASON_AUTH_NEEDED (#352), and the REASON_AUTH_NEEDED write at the legacy post-finishAuth
+ * reconnect was removed so it could not block reconnectAfterStaleOAuthAtConnect. Together they left
+ * that reconnect with no bound, so a server answering every request with 401 kept reopening the
+ * browser. Kept distinct from REASON_AUTH_NEEDED so the stale-post-auth recovery is unaffected.
+ */
+export const REASON_POST_HANDOFF_AUTH = 'post-handoff-browser-auth'
 /** Server rejected a token immediately after finishAuth — one extra browser re-auth allowed. */
 export const REASON_STALE_POST_AUTH = 'stale-post-auth-at-connect'
 
@@ -298,7 +317,9 @@ function isRecoverableAuthError(error: Error): boolean {
 }
 
 function resetTransportAuthState(transport: Transport): void {
-  const t = transport as StreamableHTTPClientTransport & { _hasCompletedAuthFlow?: boolean }
+  // Not intersected with StreamableHTTPClientTransport: the SDK declares `_hasCompletedAuthFlow`
+  // private, and TS reduces such an intersection to `never`. The `in` guard below is the real check.
+  const t = transport as { _hasCompletedAuthFlow?: boolean }
   if (t && '_hasCompletedAuthFlow' in t) {
     t._hasCompletedAuthFlow = false
   }
@@ -306,11 +327,7 @@ function resetTransportAuthState(transport: Transport): void {
 
 /** SDK throws this when OAuth refresh succeeded but the server still returned 401 on retry. */
 export function isStalePostAuth401Error(error: unknown): boolean {
-  return (
-    error instanceof StreamableHTTPError &&
-    error.code === 401 &&
-    error.message.includes('401 after successful authentication')
-  )
+  return error instanceof StreamableHTTPError && error.code === 401 && error.message.includes('401 after successful authentication')
 }
 
 async function reconnectAfterStaleOAuthAtConnect(
@@ -327,8 +344,10 @@ async function reconnectAfterStaleOAuthAtConnect(
 ): Promise<Transport> {
   log('Rejected OAuth token at connect — clearing stale credentials and re-authenticating...')
   try {
-    if (typeof (options.authProvider as { invalidateCredentials?: (scope: string) => Promise<void> }).invalidateCredentials === 'function') {
-      await options.authProvider.invalidateCredentials('tokens')
+    if (
+      typeof (options.authProvider as { invalidateCredentials?: (scope: string) => Promise<void> }).invalidateCredentials === 'function'
+    ) {
+      await options.authProvider.invalidateCredentials?.('tokens')
     }
   } catch (invalidateError) {
     debugLog('Failed to invalidate cached OAuth tokens at connect', { invalidateError })
@@ -409,11 +428,10 @@ async function recoverFromStaleClientRegistration(
 
   if (!skipBrowserAuth) {
     if (
-      typeof (options.authProvider as { invalidateCredentials?: (scope: string) => Promise<void> })
-        .invalidateCredentials === 'function'
+      typeof (options.authProvider as { invalidateCredentials?: (scope: string) => Promise<void> }).invalidateCredentials === 'function'
     ) {
       log('Stale OAuth client registration — primary clearing credentials before fresh registration')
-      await options.authProvider.invalidateCredentials('all')
+      await options.authProvider.invalidateCredentials?.('all')
     } else {
       // Cannot clear the stale client registration — fail clearly and never reconnect with stale state.
       log('Stale OAuth client registration — provider cannot clear it; failing without reconnect')
@@ -425,6 +443,82 @@ async function recoverFromStaleClientRegistration(
 
   log(`Recursively reconnecting for reason: ${REASON_STALE_CLIENT_REGISTRATION}`)
   return options.reconnect()
+}
+
+/**
+ * The result of the secondary token-handoff ladder.
+ *
+ * - `connected`: a reconnect was performed (Step A disk re-read, or the Step B recovery reconnect)
+ *   and produced a transport to return to the caller.
+ * - `takeover`: the primary vanished and the coordinator elected THIS instance primary, so the
+ *   caller should fall through to its normal browser-auth flow using the returned callback.
+ */
+type SecondaryHandoffOutcome =
+  | { kind: 'connected'; transport: Transport }
+  | { kind: 'takeover'; waitForAuthCode: () => Promise<string>; callbackPort: number }
+
+/**
+ * Bounded recovery for a SECONDARY instance whose 401 was answered by a token handoff (#352).
+ *
+ * The retry budget is split from normal OAuth recovery so a handoff always gets its own allowance,
+ * yet remains strictly bounded via two distinct one-shot reasons in the shared `recursionReasons`
+ * set:
+ *
+ *   Step A (REASON_TOKEN_HANDOFF, once): reconnect and let the auth provider re-read the primary's
+ *     tokens from disk. This preserves the existing #322 behavior — no browser, no coordination
+ *     reset — for the common "tokens were just written" case.
+ *
+ *   Step B (REASON_AUTH_NEEDED, once): the handed-over tokens still failed. Attempt exactly one
+ *     coordinated recovery via authInitializer(true). The exclusive callback-port bind (#17) makes
+ *     a duplicate primary impossible:
+ *       - primary still alive  -> we re-coordinate as a secondary and re-poll its tokens, then
+ *         reconnect once more (bounded by REASON_AUTH_NEEDED);
+ *       - primary gone         -> the coordinator elected us primary, so we hand control back to
+ *         the caller's normal browser-auth flow (`takeover`).
+ *
+ * When both allowances are spent while the primary still owns coordination, this throws
+ * SecondaryHandoffExhaustedError — a benign terminal the proxy turns into a quiet exit only once a
+ * live primary is confirmed.
+ */
+async function handleSecondaryTokenHandoff(options: {
+  recursionReasons: Set<string>
+  authInitializer: AuthInitializer
+  reconnect: () => Promise<Transport>
+}): Promise<SecondaryHandoffOutcome> {
+  const { recursionReasons, authInitializer, reconnect } = options
+
+  // Step A: one bounded reconnect re-reading the primary's tokens from disk (#322).
+  if (!recursionReasons.has(REASON_TOKEN_HANDOFF)) {
+    recursionReasons.add(REASON_TOKEN_HANDOFF)
+    log('Authentication completed by another instance - reconnecting with the tokens it wrote')
+    return { kind: 'connected', transport: await reconnect() }
+  }
+
+  // Step B: the handed-over tokens were rejected. One coordinated recovery, bounded separately.
+  if (recursionReasons.has(REASON_AUTH_NEEDED)) {
+    // Handoff reconnect and coordinated recovery are both spent, and we are still a secondary:
+    // there is nothing left to try without becoming a duplicate primary.
+    throw new SecondaryHandoffExhaustedError()
+  }
+
+  log('Handed-over tokens were rejected - attempting one coordinated auth recovery')
+  const recovery = await authInitializer(true)
+
+  if (recovery.skipBrowserAuth) {
+    // Primary still owns the callback port; we re-coordinated as a secondary and re-polled its
+    // tokens. Reconnect once more — if this still fails, the next pass hits the exhausted throw
+    // above (REASON_AUTH_NEEDED is now set), so recovery stays bounded to a single attempt.
+    recursionReasons.add(REASON_AUTH_NEEDED)
+    log('Coordinated recovery kept this instance secondary - reconnecting once with refreshed tokens')
+    return { kind: 'connected', transport: await reconnect() }
+  }
+
+  // Primary vanished: the coordinator elected THIS instance primary (the exclusive port bind
+  // guarantees there is no other). Hand control back so the caller runs its normal browser-auth
+  // flow with the freshly elected primary's callback. REASON_AUTH_NEEDED is deliberately NOT set
+  // here so that flow keeps its own one-shot budget.
+  log('Primary instance is no longer coordinating - taking over to authenticate directly')
+  return { kind: 'takeover', waitForAuthCode: recovery.waitForAuthCode, callbackPort: recovery.callbackPort }
 }
 
 export function isLocalHttpServer(serverUrl: string): boolean {
@@ -764,7 +858,9 @@ export function mcpProxy({
     })
   }
 
-  transportToServer.onmessage = (_message) => {
+  // Annotated because `transportToServer` is a union whose `onmessage` signatures differ in arity,
+  // so TS cannot contextually type this parameter (it would be an implicit `any`).
+  transportToServer.onmessage = (_message: JSONRPCMessage) => {
     // Responses to our own internal re-initialize handshake are ours to consume, never the
     // client's (issue #269). They carry a sentinel id we minted in doReinitializeSession.
     const reinitId = (_message as Message)?.id
@@ -948,9 +1044,7 @@ export function mcpProxy({
       log('onSendError: Error completing authorization:', authError)
       await replyAuthErrorToClient(
         failedMessage,
-        authError instanceof Error
-          ? authError.message
-          : 'MCP OAuth session expired — sign in again in your browser',
+        authError instanceof Error ? authError.message : 'MCP OAuth session expired — sign in again in your browser',
       )
       return
     }
@@ -1326,7 +1420,7 @@ export async function connectToRemoteServer(
       }
       if (error instanceof UnauthorizedError || (error instanceof Error && error.message.includes('Unauthorized'))) {
         log('Authentication required. Initializing auth...')
-        const { waitForAuthCode, skipBrowserAuth, callbackPort: authCallbackPort } = await authInitializer()
+        let { waitForAuthCode, skipBrowserAuth, callbackPort: authCallbackPort } = await authInitializer()
 
         if (!skipBrowserAuth && authCallbackPort > 0) {
           await waitForCallbackServer(authCallbackPort)
@@ -1334,27 +1428,32 @@ export async function connectToRemoteServer(
 
         // A concurrent instance completed the browser flow and persisted the tokens. We have no
         // authorization code of our own to exchange (our callback server never received one, and
-        // the sibling's code is already redeemed), so reconnect and let the auth provider re-read
-        // the sibling's tokens from disk rather than await a code that never arrives (#322).
-        // Bounded once via recursionReasons so a token that still does not work does not loop.
+        // the sibling's code is already redeemed), so run the bounded token-handoff ladder rather
+        // than await a code that never arrives (#322/#352).
         if (skipBrowserAuth) {
-          if (recursionReasons.has(REASON_AUTH_NEEDED)) {
-            const errorMessage = `Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`
-            log(errorMessage)
-            throw new Error(errorMessage)
-          }
-          recursionReasons.add(REASON_AUTH_NEEDED)
-          log('Authentication completed by another instance - reconnecting with the tokens it wrote')
-          return connectToRemoteServer(
-            client,
-            serverUrl,
-            authProvider,
-            headers,
-            authInitializer,
-            transportStrategy,
+          const outcome = await handleSecondaryTokenHandoff({
             recursionReasons,
-            PROTOCOL_2026_07_28,
-          )
+            authInitializer,
+            reconnect: () =>
+              connectToRemoteServer(
+                client,
+                serverUrl,
+                authProvider,
+                headers,
+                authInitializer,
+                transportStrategy,
+                recursionReasons,
+                PROTOCOL_2026_07_28,
+              ),
+          })
+          if (outcome.kind === 'connected') return outcome.transport
+          // Primary vanished and the coordinator elected us primary: fall through to the normal
+          // browser-auth flow using the freshly elected primary's callback.
+          waitForAuthCode = outcome.waitForAuthCode
+          authCallbackPort = outcome.callbackPort
+          if (authCallbackPort > 0) {
+            await waitForCallbackServer(authCallbackPort)
+          }
         }
 
         log('Authentication required. Waiting for authorization...')
@@ -1517,13 +1616,10 @@ export async function connectToRemoteServer(
         sseTransport ? 'http-only' : 'sse-only',
         recursionReasons,
       )
-    } else if (
-      error instanceof OAuthError &&
-      (error.message?.includes('refresh_token') || error.errorCode === 'invalid_request')
-    ) {
+    } else if (error instanceof OAuthError && (error.message?.includes('refresh_token') || error.errorCode === 'invalid_request')) {
       log('Stale OAuth refresh token — clearing cached tokens and reconnecting...')
       if (typeof (authProvider as { invalidateCredentials?: (scope: string) => Promise<void> }).invalidateCredentials === 'function') {
-        await authProvider.invalidateCredentials('tokens')
+        await authProvider.invalidateCredentials?.('tokens')
       }
       if (recursionReasons.has(REASON_AUTH_NEEDED)) {
         throw error
@@ -1569,7 +1665,7 @@ export async function connectToRemoteServer(
 
       // Initialize authentication on-demand
       debugLog('Calling authInitializer to start auth flow')
-      const { waitForAuthCode, skipBrowserAuth, callbackPort: authCallbackPort } = await authInitializer()
+      let { waitForAuthCode, skipBrowserAuth, callbackPort: authCallbackPort } = await authInitializer()
 
       if (!skipBrowserAuth && authCallbackPort > 0) {
         await waitForCallbackServer(authCallbackPort)
@@ -1577,27 +1673,32 @@ export async function connectToRemoteServer(
 
       // A concurrent instance completed the browser flow and persisted the tokens. We have no
       // authorization code of our own to exchange (our callback server never received one, and the
-      // sibling's code is already redeemed), so reconnect and let the auth provider re-read the
-      // sibling's tokens from disk rather than await a code that never arrives (#322). Bounded once
-      // via recursionReasons so a token that still does not work does not loop.
+      // sibling's code is already redeemed), so run the bounded token-handoff ladder rather than
+      // await a code that never arrives (#322/#352).
       if (skipBrowserAuth) {
-        if (recursionReasons.has(REASON_AUTH_NEEDED)) {
-          const errorMessage = `Already attempted reconnection for reason: ${REASON_AUTH_NEEDED}. Giving up.`
-          log(errorMessage)
-          throw new Error(errorMessage)
-        }
-        recursionReasons.add(REASON_AUTH_NEEDED)
-        log('Authentication completed by another instance - reconnecting with the tokens it wrote')
-        return connectToRemoteServer(
-          client,
-          serverUrl,
-          authProvider,
-          headers,
-          authInitializer,
-          transportStrategy,
+        const outcome = await handleSecondaryTokenHandoff({
           recursionReasons,
-          protocolMode,
-        )
+          authInitializer,
+          reconnect: () =>
+            connectToRemoteServer(
+              client,
+              serverUrl,
+              authProvider,
+              headers,
+              authInitializer,
+              transportStrategy,
+              recursionReasons,
+              protocolMode,
+            ),
+        })
+        if (outcome.kind === 'connected') return outcome.transport
+        // Primary vanished and the coordinator elected us primary: fall through to the normal
+        // browser-auth flow using the freshly elected primary's callback.
+        waitForAuthCode = outcome.waitForAuthCode
+        authCallbackPort = outcome.callbackPort
+        if (authCallbackPort > 0) {
+          await waitForCallbackServer(authCallbackPort)
+        }
       }
 
       log('Authentication required. Waiting for authorization...')
@@ -1619,6 +1720,24 @@ export async function connectToRemoteServer(
             recursionReasons: Array.from(recursionReasons),
           })
           throw new Error(errorMessage)
+        }
+
+        // An instance that already spent its token handoff (#352) gets exactly one browser-auth
+        // verification reconnect. Without this the handoff route has no bound at all: the handoff no
+        // longer spends REASON_AUTH_NEEDED, and the REASON_AUTH_NEEDED write that used to sit here
+        // was removed so it could not block reconnectAfterStaleOAuthAtConnect — so a server that
+        // keeps returning 401 reopened the browser indefinitely. Scoped to the handoff route on
+        // purpose: a plain primary never sets REASON_TOKEN_HANDOFF and is left exactly as before.
+        if (recursionReasons.has(REASON_TOKEN_HANDOFF)) {
+          if (recursionReasons.has(REASON_POST_HANDOFF_AUTH)) {
+            const errorMessage = `Already attempted reconnection for reason: ${REASON_POST_HANDOFF_AUTH}. Giving up.`
+            log(errorMessage)
+            debugLog('Post-handoff browser auth already attempted, giving up', {
+              recursionReasons: Array.from(recursionReasons),
+            })
+            throw new Error(errorMessage)
+          }
+          recursionReasons.add(REASON_POST_HANDOFF_AUTH)
         }
 
         // Verify the new token on a fresh connect. Do not set REASON_AUTH_NEEDED here —
@@ -1753,13 +1872,13 @@ export async function setupOAuthCallbackServerWithLongPoll(options: OAuthCallbac
     return new Promise((resolve) => {
       if (authCode) {
         resolve(authCode)
-        authCode = null 
+        authCode = null
         return
       }
 
       options.events.once('auth-code-received', (code) => {
         resolve(code)
-        authCode = null 
+        authCode = null
       })
     })
   }
@@ -1840,10 +1959,7 @@ async function resolveCallbackPort(serverUrlHash: string, specifiedPort?: number
 
   if (specifiedPort) {
     if (existingClientPort && specifiedPort !== existingClientPort) {
-      await invalidateOAuthClientRegistration(
-        serverUrlHash,
-        `callback port changed from ${existingClientPort} to ${specifiedPort}`,
-      )
+      await invalidateOAuthClientRegistration(serverUrlHash, `callback port changed from ${existingClientPort} to ${specifiedPort}`)
     }
     return specifiedPort
   }
@@ -1877,7 +1993,6 @@ async function bindExpressServer(
       }
 
       return { server, port }
-
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
         // When used as an election mutex the caller must observe EADDRINUSE (to become a

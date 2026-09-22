@@ -1,11 +1,7 @@
 import { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
 import { fetch } from 'undici'
 import { MCP_REMOTE_VERSION } from './utils.js'
-import {
-  injectRequestMeta,
-  PROTOCOL_2026_07_28,
-  type ProtocolMode,
-} from './stateless-protocol.js'
+import { injectRequestMeta, PROTOCOL_2026_07_28, type ProtocolMode } from './stateless-protocol.js'
 
 /**
  * Probe whether the remote server supports MCP 2026-07-28 via server/discover.

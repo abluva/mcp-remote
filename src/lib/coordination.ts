@@ -20,6 +20,7 @@ export type AuthCoordinator = {
     waitForAuthCode: () => Promise<string>
     skipBrowserAuth: boolean
     callbackPort: number
+    coordinationPort: number
   }>
   resetAuth: () => Promise<void>
 }
@@ -29,6 +30,14 @@ type PrimaryHandlers = {
   waitForAuthCode: () => Promise<string>
   skipBrowserAuth: boolean
   callbackPort: number
+  /**
+   * The port on which this instance is coordinating with the OAuth primary — i.e. where the
+   * elected primary's callback server actually listens. For a primary this equals its own bound
+   * port; for a secondary it is the (possibly deterministic-fallback) port it confirmed the
+   * primary on, NOT its throwaway dummy `callbackPort`. Used to confirm a live primary in the
+   * fallback scenario where the canonical port is held by an unrelated process (#352/#17).
+   */
+  coordinationPort: number
 }
 
 /**
@@ -153,6 +162,7 @@ async function registerPrimary(
     waitForAuthCode,
     skipBrowserAuth: false,
     callbackPort: actualPort,
+    coordinationPort: actualPort,
   }
 }
 
@@ -242,9 +252,7 @@ export function createLazyAuthCoordinator(
 
       if (options?.force) {
         const canReuseExistingServer =
-          authState?.server &&
-          !authState.skipBrowserAuth &&
-          (await isCallbackServerListening(authState.callbackPort))
+          authState?.server && !authState.skipBrowserAuth && (await isCallbackServerListening(authState.callbackPort))
         if (canReuseExistingServer) {
           log(`Reusing OAuth callback server on port ${authState!.callbackPort} for re-authentication`)
           events.emit('reset-auth-code')
@@ -272,19 +280,17 @@ export function createLazyAuthCoordinator(
  * Builds the secondary-instance result: a throwaway server (for API/cleanup compatibility)
  * and a no-op waitForAuthCode. The secondary uses the tokens the primary wrote to disk.
  */
-function makeSecondaryResult(): PrimaryHandlers {
+function makeSecondaryResult(coordinationPort: number): PrimaryHandlers {
   const dummyServer = express().listen(0) // Listen on any available port
   const dummyPort = (dummyServer.address() as AddressInfo).port
-  debugLog('Started dummy server for secondary instance', { port: dummyPort })
+  debugLog('Started dummy server for secondary instance', { port: dummyPort, coordinationPort })
 
   // Never awaited in normal operation: callers branch on skipBrowserAuth and reconnect using the
   // tokens the primary wrote to disk. Reject rather than return a promise that never settles, so a
   // caller that does reach it fails fast instead of hanging until the MCP host times out (#322).
   const dummyWaitForAuthCode = () => {
     log('WARNING: waitForAuthCode called in secondary instance - this is unexpected')
-    return Promise.reject(
-      new Error('waitForAuthCode is not available in a secondary instance; reconnect using the tokens on disk instead'),
-    )
+    return Promise.reject(new Error('waitForAuthCode is not available in a secondary instance; reconnect using the tokens on disk instead'))
   }
 
   return {
@@ -292,6 +298,8 @@ function makeSecondaryResult(): PrimaryHandlers {
     waitForAuthCode: dummyWaitForAuthCode,
     skipBrowserAuth: true,
     callbackPort: dummyPort,
+    // The real port where the elected primary is listening (may be a deterministic fallback port).
+    coordinationPort,
   }
 }
 
@@ -340,7 +348,11 @@ export async function coordinateAuth(
 
     // 1) Try to exclusively own this candidate port -> PRIMARY.
     try {
-      const { server, waitForAuthCode, port: actualPort } = await setupOAuthCallbackServerWithLongPoll({
+      const {
+        server,
+        waitForAuthCode,
+        port: actualPort,
+      } = await setupOAuthCallbackServerWithLongPoll({
         port,
         path: '/oauth/callback',
         events,
@@ -348,7 +360,9 @@ export async function coordinateAuth(
         allowPortFallback: false, // never drift; we walk a deterministic sequence instead
       })
       if (candidateIndex > 0) {
-        log(`Canonical port ${callbackPort} was occupied by an unrelated process; elected primary on fallback port ${actualPort} (pid ${process.pid})`)
+        log(
+          `Canonical port ${callbackPort} was occupied by an unrelated process; elected primary on fallback port ${actualPort} (pid ${process.pid})`,
+        )
       } else {
         log(`Elected OAuth primary on callback port ${actualPort} (pid ${process.pid})`)
       }
@@ -376,7 +390,9 @@ export async function coordinateAuth(
       const outcome = await waitForPrimaryOrTakeover(port, authTimeoutMs)
       if (outcome === 'completed') {
         log('Authentication completed by another instance. Using tokens from disk')
-        return makeSecondaryResult()
+        // Carry the actual coordinating port (this candidate, possibly a deterministic fallback),
+        // NOT the dummy port, so a live-primary check later probes the right server (#352).
+        return makeSecondaryResult(port)
       }
       if (outcome === 'timeout') {
         // Primary stayed alive but never completed OAuth within the shared auth timeout.
